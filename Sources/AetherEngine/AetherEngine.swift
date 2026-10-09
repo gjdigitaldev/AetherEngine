@@ -7760,6 +7760,21 @@ public final class AetherEngine: ObservableObject {
         settleOwedBackgroundAction()
     }
 
+    /// givo-5: the app was already in the background when this engine was created or loaded (an
+    /// autoplay-next on the lock screen), so the didEnterBackground notification that applies the
+    /// background policy fired before the engine existed and `isBackgrounded` never turned true. A host
+    /// that knows says so here. A no-op once the engine is backgrounded; the engine's own
+    /// didBecomeActive observer ends it like a notified background.
+    public func noteAlreadyInBackground() {
+        #if os(iOS) || os(tvOS)
+        guard !isBackgrounded else { return }
+        noteDidEnterBackground()
+        EngineLog.emit("[AetherEngine] background: the host reports the app was already in the background "
+                       + "at this session (givo-5); applying the background policy", category: .engine)
+        Task { @MainActor [weak self] in await self?.applyBackgroundPolicy() }
+        #endif
+    }
+
     /// didEnterBackground's bookkeeping. Audit CORE-2: a load or seek in flight has a pipeline
     /// (loopback server, AVIO connection, the item) but no settled state to judge it by, and it
     /// settles into `.playing` in the background with nothing left to look again. Owe it the decision.

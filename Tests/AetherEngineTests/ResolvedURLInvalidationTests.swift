@@ -280,7 +280,8 @@ struct ResolvedURLInvalidationTests {
 
         let boundaryAttempts = cdn.requestLog.filter { $0.start == firstRange }.count
         #expect(boundaryAttempts >= 2, "the ladder must retry a metered origin")
-        #expect(boundaryAttempts <= 7,
+        // givo-1: + 1, the quick retry a refusal right after the completed range gets first.
+        #expect(boundaryAttempts <= 8,
                 "509 must give up at the bounded rate-limit cap, not grind: \(boundaryAttempts) attempts")
         // The keep-pin grace holds for the first attempts, then the rung spends the
         // re-resolve: some retries reach the source, but bounded by the ladder — never
@@ -347,8 +348,9 @@ struct ResolvedURLInvalidationTests {
         // 1 free replacement of the planned range end + the grace attempts, all against the
         // dead lease; the rung's attempt is the one that goes through the source.
         let boundaryAttempts = cdn.requestLog.filter { $0.start == firstRange }.count
-        #expect(boundaryAttempts == AVIOReader.rateLimitRepinStreak + 1,
-                "expected the grace against the pin plus one healed attempt, got \(boundaryAttempts)")
+        // givo-1: + 1, the quick retry a refusal right after the completed range gets first.
+        #expect(boundaryAttempts == AVIOReader.rateLimitRepinStreak + 2,
+                "expected the quick retry, the grace against the pin and one healed attempt, got \(boundaryAttempts)")
         #expect(leases.mintsAfterFault == 1,
                 "healing must cost exactly one source resolve, spent \(leases.mintsAfterFault): \(source.requestLog)")
         let sourceHitsAtBoundary = source.requestLog.filter { $0.start == firstRange }
@@ -399,7 +401,8 @@ struct ResolvedURLInvalidationTests {
         #expect(result == -1, "a permanently refused source must fail the read, not hang")
         let boundaryAttempts = cdn.requestLog.filter { $0.start == firstRange }.count
         #expect(boundaryAttempts >= 3, "the ladder must retry a metered origin")
-        #expect(boundaryAttempts <= 7,
+        // givo-1: + 1, the quick retry a refusal right after the completed range gets first.
+        #expect(boundaryAttempts <= 8,
                 "served reads reset the streak: \(boundaryAttempts) attempts at the boundary")
     }
 

@@ -114,8 +114,8 @@ final class OriginRequestBudget: @unchecked Sendable {
         /// givo-4: what refusals taught while no host ceiling was in force, so clearing the host
         /// ceiling can put it back. `limit` alone cannot tell a learned value from a host one.
         var learnedLimit: Int?
-        /// givo-1: when a connection to this origin was last ended by us while the origin was still
-        /// serving it (a seek, a reconnect, a close). A connection-capped panel keeps counting such a
+        /// givo-1: when a connection of ours that this origin was serving last ended (a seek, a
+        /// reconnect, a close, a completed range). A connection-capped panel keeps counting such a
         /// connection for about a second after it closes, so a refusal that lands inside that window
         /// is our own previous connection, not the origin metering a new one.
         var lastOwnCloseAt: DispatchTime?
@@ -649,7 +649,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         origins[key] = state
     }
 
-    /// givo-1: a connection to this origin was just ended by us (see `OriginState.lastOwnCloseAt`).
+    /// givo-1: a connection of ours to this origin just ended (see `OriginState.lastOwnCloseAt`).
     /// Kept on the books rather than on the reader because the next request is often another
     /// reader's: a restart's fresh demuxer, or the next session's open right after a stop.
     func noteOwnClose(for url: URL) {
@@ -662,8 +662,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         origins[key] = state
     }
 
-    /// givo-1: seconds since this origin last saw one of our connections end at our hand, nil when
-    /// it never has.
+    /// givo-1: seconds since one of our connections to this origin last ended, nil when none has.
     func secondsSinceOwnClose(for url: URL) -> Double? {
         guard let raw = Self.originKey(for: url) else { return nil }
         lock.lock(); defer { lock.unlock() }

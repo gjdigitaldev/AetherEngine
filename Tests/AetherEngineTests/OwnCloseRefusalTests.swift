@@ -61,4 +61,43 @@ struct OwnCloseRefusalTests {
                 "the revive arm still has to see that a refusal happened")
         #expect(elapsed < 6, "one second of retry, not the 2/4/8 s ladder (took \(elapsed)s)")
     }
+
+    @Test("a slot refusal right after a completed range is the same lingering slot",
+          .timeLimit(.minutes(2)), arguments: [509, 460])
+    func refusalAfterCompletedRangeRetriesOnce(status: Int) async throws {
+        // F1 on a 1-connection provider: the request for the next 32 MiB range, sent as the last one
+        // completed, was refused 509 three times and stalled playback.
+        let firstRange: Int64 = 4 * 1024 * 1024
+        let hitsAtBoundary = Counter()
+        let serverMaybe = ThrottledOriginServer(
+            totalSize: 32 * 1024 * 1024,
+            respond: { _, offset, _ in
+                guard offset == firstRange else { return .serve206 }
+                return hitsAtBoundary.next() == 1 ? .status(status) : .serve206
+            })
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+
+        let url = URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
+        let reader = AVIOReader(url: url, boundedInitialFetch: firstRange)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let slice = 128 * 1024
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: slice)
+        defer { buf.deallocate() }
+        var got: Int64 = 0
+        while got < firstRange + Int64(slice) {
+            let n = reader.read(into: buf, size: Int32(slice))
+            if n <= 0 { break }
+            got += Int64(n)
+        }
+
+        #expect(got >= firstRange + Int64(slice), "reading must continue past the refused boundary")
+        #expect(server.requestLog.filter { $0.start == firstRange }.count == 2,
+                "one refusal, one retry: \(server.requestLog)")
+        #expect(reader.rateLimitStreakForTesting == 0)
+        #expect(OriginRequestBudget.shared.limit(for: url) == nil)
+        #expect(!OriginRequestBudget.shared.isPaced(url))
+    }
 }

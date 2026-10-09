@@ -108,8 +108,9 @@ final class HeldSourceConnection: @unchecked Sendable {
     /// givo-1: set once the run loop has ended and reported it.
     private let endLatch = TransferEndLatch()
     private var _started = false
-    /// givo-1: the origin refused the response, so the close that follows answers a refusal.
-    private var responseRefused = false
+    /// givo-1: the origin's response was accepted, so the end of this connection is the end of one
+    /// the origin was serving.
+    private var responseAccepted = false
 
     init(url: URL,
          offset: Int64,
@@ -194,12 +195,12 @@ final class HeldSourceConnection: @unchecked Sendable {
             // deliberate end.
             failure = isCancelled ? nil : error
         }
-        // givo-1: cancelled from outside while the origin was serving us = our own close.
+        // givo-1: a connection the origin was serving has ended, whoever ended it.
         stateLock.lock()
-        let endedByUs = _cancelled && !responseRefused
+        let served = responseAccepted
         stateLock.unlock()
         cancel()
-        if endedByUs { OriginRequestBudget.shared.noteOwnClose(for: respondedBy) }
+        if served { OriginRequestBudget.shared.noteOwnClose(for: respondedBy) }
         delegate?.heldConnection(self, didEndWith: failure)
     }
 
@@ -231,9 +232,9 @@ final class HeldSourceConnection: @unchecked Sendable {
                 throw ConnectionError.malformedResponse("status \(head.status)")
             }
             guard delegate?.heldConnection(self, didReceive: response, from: target) == true else {
-                stateLock.lock(); responseRefused = true; stateLock.unlock()   // givo-1
                 return
             }
+            stateLock.lock(); responseAccepted = true; stateLock.unlock()   // givo-1
             try pump(framing: Self.framing(for: head))
             return
         }

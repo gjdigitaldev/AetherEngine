@@ -458,6 +458,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard Self.isSlotRefusalStatus(status),
               let since = OriginRequestBudget.shared.secondsSinceOwnClose(for: respondedBy ?? requestURL()),
               since <= Self.selfCausedRefusalWindowSeconds else { return nil }
+        // #392 owns an idle pin: with nothing delivered for `pinIdleSeconds`, a refusal through the
+        // pin is its expired lease, and that rung drops the pin on the first one.
+        if cachedResolvedURL() != nil, secondsSinceNetworkDelivery() >= pinIdleSeconds { return nil }
         winCond.lock()
         defer { winCond.unlock() }
         guard generation == connGeneration, !selfCausedRetrySpent else { return nil }
@@ -3710,7 +3713,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             OriginRequestBudget.shared.noteRefusalWitnessed(for: respondedBy ?? requestURL())
             EngineLog.emit(
                 "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(sinceClose * 1000))ms after our "
-                + "own close: the origin still counts that connection; one retry in "
+                + "last connection ended: the origin still counts it; one retry in "
                 + "\(String(format: "%.1f", Self.selfCausedRetryDelaySeconds * backoffScale))s before the ladder (givo-1)",
                 category: .demux)
         } else if Self.isRateLimitStatus(status) {
@@ -5072,9 +5075,9 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     private let originURL: URL
     /// givo-1: set once the task has reported its end, cancels included.
     let endLatch = TransferEndLatch()
-    /// givo-1: the origin refused this request, so its end is the answer to a refusal rather than
-    /// a connection the origin was serving being ended by us.
-    private var responseRefused = false
+    /// givo-1: the origin's response was accepted, so the end of this task is the end of a
+    /// connection the origin was serving.
+    private var responseAccepted = false
 
     init(reader: AVIOReader, generation: Int, extraHeaders: [String: String],
          ticket: OriginRequestBudget.Ticket?, originURL: URL) {
@@ -5138,8 +5141,8 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         let allow = reader.persistentReceivedResponse(
             http, respondedBy: respondedBy, generation: generation
         )
-        if !allow {   // givo-1
-            ticketLock.lock(); responseRefused = true; ticketLock.unlock()
+        if allow {   // givo-1
+            ticketLock.lock(); responseAccepted = true; ticketLock.unlock()
         }
         completionHandler(allow ? .allow : .cancel)
     }
@@ -5158,13 +5161,13 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         didCompleteWithError error: Error?
     ) {
         releaseTicket()
-        // givo-1: a cancel of a connection the origin was serving is our own close; stamp the
-        // origin's books with the moment it was acknowledged, which is what a refusal of the next
-        // request is measured against.
+        // givo-1: a connection the origin was serving has ended (our cancel, a completed range, a
+        // drop); stamp the origin's books with the moment it was acknowledged, which is what a
+        // refusal of the next request is measured against.
         ticketLock.lock()
-        let refused = responseRefused
+        let served = responseAccepted
         ticketLock.unlock()
-        if (error as? URLError)?.code == .cancelled, !refused {
+        if served {
             OriginRequestBudget.shared.noteOwnClose(for: originURL)
         }
         endLatch.markEnded()

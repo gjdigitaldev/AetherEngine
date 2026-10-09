@@ -794,6 +794,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// session builds. Set before `start()`.
     var servesSegmentsProgressively = false
 
+    /// givo-3: `LoadOptions.firstSegmentTargetSeconds`, read by the VOD planner. Set before `start()`.
+    var firstSegmentTargetSeconds: Double?
+
     /// Serializes restart requests among themselves. Held across waits (unlike `restartLock`);
     /// only other restarts contend on it.
     private let restartGate = NSLock()
@@ -1369,6 +1372,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds
                 )
+                if let firstTarget = firstSegmentTargetSeconds {   // givo-3
+                    let before = plan.first?.durationSeconds ?? 0
+                    plan = Self.splitFirstSegment(plan, keyframes: keyframes, videoTimeBase: videoTimeBase,
+                                                  targetSeconds: firstTarget)
+                    EngineLog.emit(
+                        "[HLSVideoEngine] first segment: target \(String(format: "%.1f", firstTarget))s, "
+                        + "\(String(format: "%.3f", before))s -> \(String(format: "%.3f", plan.first?.durationSeconds ?? 0))s (givo-3)",
+                        category: .session)
+                }
                 planBoundariesClaimRandomAccess = true
                 // AE#561: these boundaries ARE this container's index entries, so they carry its
                 // stamping. Read from the demuxer that produced them, never from the URL or the

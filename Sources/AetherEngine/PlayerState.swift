@@ -821,6 +821,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// `nativeRemoteHLS` and on the software path, which serve no loopback segments.
     public var progressiveSegmentDelivery: Bool = false
 
+    /// givo-3: cut the first VOD loopback segment at the first keyframe at or after this many seconds
+    /// instead of at the full cut target, so AVPlayer can start on a segment one GOP long. Only a
+    /// keyframe-aligned plan is split, only where a keyframe falls inside the default first segment,
+    /// and every later boundary stays the default plan's. Values outside 1 s up to the cut target are
+    /// ignored. nil (the default) keeps the default first segment. Ignored for live, for
+    /// `nativeRemoteHLS` and on the software path.
+    public var firstSegmentTargetSeconds: Double? = nil
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on

@@ -384,6 +384,32 @@ extension HLSVideoEngine {
         return plan
     }
 
+    /// givo-3: `LoadOptions.firstSegmentTargetSeconds`. Splits a keyframe-aligned plan's first segment
+    /// at its first keyframe at or after `targetSeconds` (from the content start), so AVPlayer can start
+    /// on a segment that is one GOP long instead of the full cut target. Every later boundary is the
+    /// default plan's, so the rest of the playlist, and every seek that lands there, is unchanged. No
+    /// split where the GOP leaves no keyframe inside the first segment, or where the target is outside
+    /// [`minSegmentDurationSeconds`, `targetSegmentDuration`).
+    static func splitFirstSegment(_ plan: [Segment], keyframes: [Int64], videoTimeBase: AVRational,
+                                  targetSeconds: Double) -> [Segment] {
+        guard let first = plan.first, targetSeconds >= minSegmentDurationSeconds,
+              targetSeconds < targetSegmentDuration,
+              videoTimeBase.num > 0, videoTimeBase.den > 0 else { return plan }
+        let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
+        guard let cut = keyframes.sorted().first(where: { pts in
+            pts > first.startPts && pts < first.endPts
+                && Double(pts - first.startPts) * tb >= targetSeconds
+        }) else { return plan }
+        let headSeconds = Double(cut - first.startPts) * tb
+        guard first.durationSeconds - headSeconds >= minSegmentDurationSeconds else { return plan }
+        let head = Segment(startPts: first.startPts, endPts: cut, startSeconds: first.startSeconds,
+                           durationSeconds: headSeconds, discontinuous: first.discontinuous)
+        let rest = Segment(startPts: cut, endPts: first.endPts,
+                           startSeconds: first.startSeconds + headSeconds,
+                           durationSeconds: first.durationSeconds - headSeconds)
+        return [head, rest] + plan.dropFirst()
+    }
+
     /// Segments shorter than this are folded into a neighbour by `collapseShortSegments`. A keyframe
     /// cluster (several IRAPs within a few frames) otherwise makes `buildKeyframeSegmentPlan` emit
     /// sub-frame segments whose narrow [start,end) window can miss every demuxed keyframe, so the producer

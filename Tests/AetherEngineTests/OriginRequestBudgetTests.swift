@@ -458,6 +458,55 @@ struct OriginRequestBudgetTests {
                 "a refusal must not halve past a ceiling the host declared")
     }
 
+    @Test("givo-4: clearing a host limit restores the learned limit, or none, not the old host value")
+    func clearingHostLimitRestoresLearned() {
+        let budget = freshBudget()
+        budget.setHostLimit(1, for: url)
+        budget.setHostLimit(nil, for: url)
+        #expect(budget.limit(for: url) == nil,
+                "an origin that never refused us is uncapped once the host drops its ceiling")
+
+        let a = budget.acquire(for: url, label: "pump", timeout: 0.1)
+        let b = budget.acquire(for: url, label: "detour", timeout: 0.1)
+        let c = budget.acquire(for: url, label: "probe", timeout: 0.1)
+        let d = budget.acquire(for: url, label: "probe", timeout: 0.1)
+        #expect(budget.noteRefusal(for: url, status: 509) == 2, "peak 4 halves to 2")
+        budget.release(a); budget.release(b); budget.release(c); budget.release(d)
+
+        budget.setHostLimit(1, for: url)
+        #expect(budget.limit(for: url) == 1)
+        budget.setHostLimit(nil, for: url)
+        #expect(budget.limit(for: url) == 2, "the learned ceiling comes back, not the host's 1")
+    }
+
+    @Test("givo-4: raising the ceiling hands the new room to a parked caller at once",
+          .timeLimit(.minutes(3)))
+    func raisingCeilingWakesWaiter() async throws {
+        let budget = freshBudget()
+        budget.setHostLimit(1, for: url)
+        let held = budget.acquire(for: url, label: "pump", timeout: 1)
+
+        let secondGranted = UnsafeFlag()
+        let secondStarted = UnsafeFlag()
+        let target = url
+        Thread.detachNewThread {
+            secondStarted.set(true)
+            let second = budget.acquire(for: target, label: "detour", timeout: 120)
+            secondGranted.set(second?.granted == true)
+            budget.release(second)
+        }
+        try await waitFor { secondStarted.value == true }
+        try await waitFor { budget.snapshot(for: url)?.waiting == 1 || secondGranted.value != nil }
+        #expect(secondGranted.value == nil, "the slot is held, so the second request parks")
+
+        budget.setHostLimit(nil, for: url)
+        try await waitFor { secondGranted.value != nil }
+        #expect(secondGranted.value == true,
+                "the cleared ceiling must hand the parked caller a slot, not leave it to its timeout")
+        budget.release(held)
+        try await waitFor { budget.snapshot(for: url)?.inflight == 0 }
+    }
+
     @Test("a refusal is remembered with a clock, so the revive arm can tell metering from death")
     func refusedRecentlyIsTimeBounded() {
         let budget = freshBudget()

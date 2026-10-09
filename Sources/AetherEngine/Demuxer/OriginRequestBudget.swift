@@ -111,6 +111,9 @@ final class OriginRequestBudget: @unchecked Sendable {
         /// nil = count only. Set by the host, or learned from a refusal.
         var limit: Int?
         var hostLimit: Int?
+        /// givo-4: what refusals taught while no host ceiling was in force, so clearing the host
+        /// ceiling can put it back. `limit` alone cannot tell a learned value from a host one.
+        var learnedLimit: Int?
         var refusals = 0
         var lastRefusalAt: DispatchTime?
         /// nil `quietUntil` means the request-rate pacer is inert. The bucket remains untouched
@@ -200,6 +203,7 @@ final class OriginRequestBudget: @unchecked Sendable {
             merged.refusals += joining.refusals
             merged.limit = Self.tighter(merged.limit, joining.limit)
             merged.hostLimit = Self.tighter(merged.hostLimit, joining.hostLimit)
+            merged.learnedLimit = Self.tighter(merged.learnedLimit, joining.learnedLimit)   // givo-4
             if let hostLimit = merged.hostLimit {
                 merged.limit = Self.tighter(merged.limit, hostLimit)
             }
@@ -602,6 +606,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         } else {
             let basis = state.limit ?? max(1, state.peakInflight)
             state.limit = max(1, basis / 2)
+            state.learnedLimit = state.limit   // givo-4
         }
         let limitNow = state.limit
         let peak = state.peakInflight
@@ -717,14 +722,28 @@ final class OriginRequestBudget: @unchecked Sendable {
     /// Host-declared ceiling for this origin. Takes precedence over anything learned, in both
     /// directions: a host that knows its provider allows one connection should not have to wait
     /// for the engine to be refused a few times to find that out.
+    ///
+    /// givo-4: clearing (nil) puts back what the origin itself taught, or no cap at all. Leaving the
+    /// old host value in force kept a one-connection ceiling for the rest of the process after the
+    /// host had dropped it, and every later prewarm against that origin declined for it.
     func setHostLimit(_ limit: Int?, for url: URL) {
         guard let raw = Self.originKey(for: url) else { return }
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         let key = headLocked(raw)
         var state = origins[key] ?? OriginState()
         state.hostLimit = limit.map { max(1, $0) }
-        if let hostLimit = state.hostLimit { state.limit = hostLimit }
+        state.limit = state.hostLimit ?? state.learnedLimit   // givo-4
+        // givo-4: a raised ceiling hands its new room to the queue now; parked callers would
+        // otherwise wait for a release or their own timeout.
+        var woken: [DispatchSemaphore] = []
+        while !state.waiters.isEmpty, state.inflight < (state.limit ?? Int.max) {
+            woken.append(state.waiters.removeFirst())
+            state.inflight += 1
+            state.peakInflight = max(state.peakInflight, state.inflight)
+        }
         origins[key] = state
+        lock.unlock()
+        for waiter in woken { waiter.signal() }
     }
 
     /// The effective ceiling for this origin, or nil while it is uncapped. On a redirect chain that

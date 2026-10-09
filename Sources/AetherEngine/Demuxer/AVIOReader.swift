@@ -394,6 +394,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return status == 429 || status == 503 || status == 509
     }
 
+    /// givo-1: the statuses a connection-capped IPTV panel answers while it still counts a
+    /// connection of ours as open: 509 (Apache fronts), 458 and 460 (Xtream-style panels). Taken as
+    /// self-caused only inside `selfCausedRefusalWindowSeconds` of our own close; outside it each
+    /// keeps its existing classification.
+    static func isSlotRefusalStatus(_ status: Int) -> Bool {
+        return status == 509 || status == 458 || status == 460
+    }
+
+    /// givo-1: how long a reconnect waits for the connection it replaces to report its end. The
+    /// provider frees the slot only after it sees the close (0.7 to 1.2 s measured), so a request
+    /// sent before our side has even finished closing is refused for the connection it replaces.
+    static let ownCloseAckWaitSeconds: TimeInterval = 1.5
+    /// givo-1: a slot refusal this soon after our own close is the provider still counting it.
+    static let selfCausedRefusalWindowSeconds: TimeInterval = 2
+    /// givo-1: the one quick retry such a refusal gets, before any ladder or budget is charged.
+    static let selfCausedRetryDelaySeconds: TimeInterval = 1
+
     /// Hard server errors answered by a pinned post-redirect URL: the redirect target
     /// may be dead or expired while the source URL would mint a fresh one. Rate-limit
     /// statuses are excluded — the origin is metering us, and the pin is not the
@@ -431,6 +448,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // proxy did not refuse us and should not be throttled for it.
         if OriginRequestBudget.originKey(for: refusing) != OriginRequestBudget.originKey(for: url) {
             OriginRequestBudget.shared.noteRefusalWitnessed(for: url)
+        }
+    }
+
+    /// givo-1: a slot refusal (`isSlotRefusalStatus`) inside `selfCausedRefusalWindowSeconds` of our
+    /// own close on this origin, with the quick retry not yet spent: mark this generation for it and
+    /// return the seconds since that close. nil for every other answer.
+    private func takeSelfCausedRefusal(status: Int, respondedBy: URL?, generation: Int) -> Double? {
+        guard Self.isSlotRefusalStatus(status),
+              let since = OriginRequestBudget.shared.secondsSinceOwnClose(for: respondedBy ?? requestURL()),
+              since <= Self.selfCausedRefusalWindowSeconds else { return nil }
+        winCond.lock()
+        defer { winCond.unlock() }
+        guard generation == connGeneration, !selfCausedRetrySpent else { return nil }
+        selfCausedRetrySpent = true
+        connSelfCausedRefusal = true
+        selfCausedRetryAt = Date().addingTimeInterval(Self.selfCausedRetryDelaySeconds * backoffScale)
+        // The serve path's refill waits on this timestamp, so it holds the retry there too.
+        nextFaultedRefillAt = selfCausedRetryAt
+        return since
+    }
+
+    /// givo-1: sleep until `date` in short slices, so a close is honoured promptly.
+    private func sleepUntilSelfCausedRetry(_ date: Date) {
+        while Date() < date {
+            if isClosed { return }
+            Thread.sleep(forTimeInterval: min(0.1, max(0, date.timeIntervalSinceNow)))
         }
     }
 
@@ -937,6 +980,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var bytesAtLastReconnect: Int64 = 0
     // Consecutive rate-limited attempts; survives seekReconnect, resets on real read progress (#71).
     private var rateLimitStreak = 0
+    /// givo-1: this generation was refused right after our own close (see `isSlotRefusalStatus`),
+    /// and gets the one quick retry at `selfCausedRetryAt` instead of the ladder. Cleared by
+    /// `startPersistentConnection`. winCond-guarded.
+    private var connSelfCausedRefusal = false
+    private var selfCausedRetryAt = Date.distantPast
+    /// givo-1: the quick retry is spent until a generation delivers or a seek starts a new lineage,
+    /// so an origin that refuses the retry too goes to the ladder rather than retrying forever.
+    /// winCond-guarded.
+    private var selfCausedRetrySpent = false
 
     /// Detour LRU block cache (its own leaf lock, never held across `fetchChunk`/network or
     /// `winCond`). Stores only full-size blocks; short bodies are served once but never cached
@@ -1241,6 +1293,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 winCond.unlock()
                 startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
                 var opened = awaitFirstPersistentData()
+                // givo-1: an open sent right after our own close (a stop and a reopen, a restart's
+                // fresh demuxer) refused for the connection that just ended: the same one retry.
+                if !opened, !isLive, let retryAt = selfCausedRefusalOfOpenConnection() {
+                    sleepUntilSelfCausedRetry(retryAt)
+                    try probeControl?.check()
+                    winCond.lock()
+                    rangeVerdictPending = true
+                    winCond.unlock()
+                    startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+                    opened = awaitFirstPersistentData()
+                }
                 // AE#693: one refusal is the origin's answer to that request, not yet to the
                 // resource. The #378 path below takes a 401/403/404/410 here as final and settles
                 // the session forward-only, which costs it every seek and the resume position. An
@@ -1493,6 +1556,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         defer { winCond.unlock() }
         return (connEnded && Self.isResolvedExpiryStatus(connStatus)) ? connStatus : nil
+    }
+
+    /// givo-1: when the open's connection ended on a self-caused refusal, the time its retry is due.
+    private func selfCausedRefusalOfOpenConnection() -> Date? {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return (connEnded && connSelfCausedRefusal) ? selfCausedRetryAt : nil
     }
 
     /// The streaming GET was answered with a status instead of a body, or the ranged open was
@@ -2380,6 +2450,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // not authoritative and its end moves.
                 var refillFrom: Int64? = nil
                 var refillFaulted = false
+                var refillSelfCaused = false   // givo-1
                 var refillStatus = 0
                 var refillRetryAfter: TimeInterval = 0
                 let undrained = window.count - max(0, Int(position - winStart))
@@ -2391,6 +2462,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     } else if connEnded, Date() >= nextFaultedRefillAt {
                         refillFrom = frontier
                         refillFaulted = true
+                        refillSelfCaused = connSelfCausedRefusal   // givo-1: already waited out via nextFaultedRefillAt
                         refillStatus = connStatus
                         refillRetryAfter = connRetryAfter
                     }
@@ -2398,9 +2470,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 winCond.broadcast()
                 winCond.unlock()
                 if let refillFrom {
-                    if !refillFaulted || chargeFaultedRunwayRefill(at: refillFrom, ahead: undrained,
-                                                                   status: refillStatus,
-                                                                   retryAfter: refillRetryAfter) {
+                    if !refillFaulted || refillSelfCaused
+                        || chargeFaultedRunwayRefill(at: refillFrom, ahead: undrained,
+                                                     status: refillStatus,
+                                                     retryAfter: refillRetryAfter) {
                         timedReconnect(seek: false, at: refillFrom)
                     }
                 }
@@ -2413,6 +2486,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let endedByRangeEnd = connEndedAtRangeEnd
             let status = connStatus
             let retryAfter = connRetryAfter
+            let selfCausedRefusal = connSelfCausedRefusal   // givo-1
+            let selfCausedRetryAt = self.selfCausedRetryAt   // givo-1
 
             if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
                 winCond.unlock()
@@ -2494,6 +2569,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 timedReconnect(seek: false, at: frontier)
                 continue
             }
+            // givo-1: refused for the connection we just ended. One retry once the provider has had
+            // its second to let go, charged to no streak and no pin rung; a refusal of the retry
+            // takes the ladder below.
+            if selfCausedRefusal {
+                let backoffStart = DispatchTime.now()
+                sleepUntilSelfCausedRetry(selfCausedRetryAt)
+                diag.recordBackoff(ms: msSince(backoffStart))
+                timedReconnect(seek: false, at: frontier)
+                continue
+            }
             // A 429/503/509 is rate limiting, not a dead source: drive give-up + backoff off the
             // rate-limit streak, which (unlike unproductiveReconnects) survives the seekReconnect
             // that parse seeks fire, so a throttled origin fails cleanly instead of looping (#71).
@@ -2550,6 +2635,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // it was charged at, and holding a seek's refill to it would pace a healthy target.
         winCond.lock()
         nextFaultedRefillAt = .distantPast
+        selfCausedRetrySpent = false   // givo-1: a reposition is a new lineage with its own retry
         winCond.unlock()
         startPersistentConnection(at: offset)
     }
@@ -3200,6 +3286,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connRangeEnd = resolvedBound.map { offset + $0 - 1 }
         connStatus = 0
         connRetryAfter = 0
+        connSelfCausedRefusal = false   // givo-1
         connStartedAt = DispatchTime.now()   // #93: time-to-first-data per generation
         connFirstDataSeen = false
         lastDeliveryAt = connStartedAt       // #309: the gap is measured from here until data lands
@@ -3223,6 +3310,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         oldTransfer?.releaseOriginTicket()
 
         if isClosed { return }
+
+        // givo-1: the slot is handed back above, but the provider counts the connection until it
+        // sees the close, so the next request waits for our side of that close first (bounded).
+        if let oldTransfer {
+            let ackStart = DispatchTime.now()
+            let acknowledged = oldTransfer.waitUntilEnded(
+                timeout: Self.ownCloseAckWaitSeconds, shouldAbort: { [weak self] in self?.isClosed ?? true })
+            let ackMs = Int(Double(DispatchTime.now().uptimeNanoseconds - ackStart.uptimeNanoseconds) / 1_000_000)
+            if !acknowledged || ackMs >= 250 {
+                EngineLog.emit(
+                    "[AVIOReader] \(label) gen=\(generation) previous connection "
+                    + (acknowledged ? "closed after \(ackMs)ms" : "not closed after \(ackMs)ms; requesting anyway")
+                    + " (givo-1)", category: .demux)
+            }
+            if isClosed { return }
+        }
 
         var request = URLRequest(url: requestURL())
         // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
@@ -3481,6 +3584,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // a give-up latch — an origin that recovered after the faulted ladder capped out may
             // fault again later and deserves a fresh ladder, not `.distantFuture` forever).
             nextFaultedRefillAt = .distantPast
+            selfCausedRetrySpent = false   // givo-1: delivery ends the lineage the retry belonged to
         }
         let count = data.count
         // #310: delivery that lands with the backpressure end ALREADY recorded, i.e. after our
@@ -3599,7 +3703,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let status = http.statusCode
         var isOK = status == 200 || status == 206
         var retryAfter: TimeInterval = 0
-        if Self.isRateLimitStatus(status) {
+        if let sinceClose = takeSelfCausedRefusal(status: status, respondedBy: respondedBy,
+                                                  generation: generation) {
+            // givo-1: the provider is still counting the connection we just ended. Witnessed (the
+            // revive arm must still see a refusal) but not charged: no halved budget, no pacer.
+            OriginRequestBudget.shared.noteRefusalWitnessed(for: respondedBy ?? requestURL())
+            EngineLog.emit(
+                "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(sinceClose * 1000))ms after our "
+                + "own close: the origin still counts that connection; one retry in "
+                + "\(String(format: "%.1f", Self.selfCausedRetryDelaySeconds * backoffScale))s before the ladder (givo-1)",
+                category: .demux)
+        } else if Self.isRateLimitStatus(status) {
             retryAfter = Self.parseRetryAfter(http)
             noteOriginRefusal(status: status, retryAfter: retryAfter > 0 ? retryAfter : nil,
                               respondedBy: respondedBy)
@@ -4899,6 +5013,36 @@ protocol PersistentTransfer: AnyObject {
     /// transport delivering on its own schedule; against a pull it would end a healthy connection
     /// and put back the request cadence the held path exists to remove.
     var isDemandDriven: Bool { get }
+    /// givo-1: block until the transport has reported its end, or `timeout` passes or `shouldAbort`
+    /// says the caller has gone. True when the end was reported. A transfer that was never started
+    /// has nothing on the link and answers true at once.
+    func waitUntilEnded(timeout: TimeInterval, shouldAbort: () -> Bool) -> Bool
+}
+
+/// givo-1: the end-of-transfer latch both transports wait on. A condition rather than a group or a
+/// semaphore: those trap when deallocated mid-use, and a delegate can be released without its task
+/// ever completing.
+final class TransferEndLatch: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var ended = false
+
+    func markEnded() {
+        condition.lock()
+        ended = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait(timeout: TimeInterval, shouldAbort: () -> Bool) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while !ended {
+            if shouldAbort() || Date() >= deadline { return false }
+            _ = condition.wait(until: min(deadline, Date(timeIntervalSinceNow: 0.05)))
+        }
+        return true
+    }
 }
 
 extension URLSessionDataTask: PersistentTransfer {
@@ -4908,6 +5052,10 @@ extension URLSessionDataTask: PersistentTransfer {
     /// note on `PersistentReadDelegate.ticket`.
     func releaseOriginTicket() { (delegate as? PersistentReadDelegate)?.releaseTicket() }
     var isDemandDriven: Bool { false }
+    func waitUntilEnded(timeout: TimeInterval, shouldAbort: () -> Bool) -> Bool {   // givo-1
+        guard state != .suspended, let delegate = delegate as? PersistentReadDelegate else { return true }
+        return delegate.endLatch.wait(timeout: timeout, shouldAbort: shouldAbort)
+    }
 }
 
 private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
@@ -4922,6 +5070,11 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     private var ticket: OriginRequestBudget.Ticket?
     /// The URL this connection was opened against, for the one-per-origin transport line.
     private let originURL: URL
+    /// givo-1: set once the task has reported its end, cancels included.
+    let endLatch = TransferEndLatch()
+    /// givo-1: the origin refused this request, so its end is the answer to a refusal rather than
+    /// a connection the origin was serving being ended by us.
+    private var responseRefused = false
 
     init(reader: AVIOReader, generation: Int, extraHeaders: [String: String],
          ticket: OriginRequestBudget.Ticket?, originURL: URL) {
@@ -4985,6 +5138,9 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         let allow = reader.persistentReceivedResponse(
             http, respondedBy: respondedBy, generation: generation
         )
+        if !allow {   // givo-1
+            ticketLock.lock(); responseRefused = true; ticketLock.unlock()
+        }
         completionHandler(allow ? .allow : .cancel)
     }
 
@@ -5002,6 +5158,16 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         didCompleteWithError error: Error?
     ) {
         releaseTicket()
+        // givo-1: a cancel of a connection the origin was serving is our own close; stamp the
+        // origin's books with the moment it was acknowledged, which is what a refusal of the next
+        // request is measured against.
+        ticketLock.lock()
+        let refused = responseRefused
+        ticketLock.unlock()
+        if (error as? URLError)?.code == .cancelled, !refused {
+            OriginRequestBudget.shared.noteOwnClose(for: originURL)
+        }
+        endLatch.markEnded()
         reader?.persistentConnectionEnded(error: error, generation: generation)
     }
 

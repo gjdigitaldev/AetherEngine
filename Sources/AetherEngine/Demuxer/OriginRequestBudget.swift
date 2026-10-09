@@ -114,6 +114,11 @@ final class OriginRequestBudget: @unchecked Sendable {
         /// givo-4: what refusals taught while no host ceiling was in force, so clearing the host
         /// ceiling can put it back. `limit` alone cannot tell a learned value from a host one.
         var learnedLimit: Int?
+        /// givo-1: when a connection to this origin was last ended by us while the origin was still
+        /// serving it (a seek, a reconnect, a close). A connection-capped panel keeps counting such a
+        /// connection for about a second after it closes, so a refusal that lands inside that window
+        /// is our own previous connection, not the origin metering a new one.
+        var lastOwnCloseAt: DispatchTime?
         var refusals = 0
         var lastRefusalAt: DispatchTime?
         /// nil `quietUntil` means the request-rate pacer is inert. The bucket remains untouched
@@ -225,6 +230,9 @@ final class OriginRequestBudget: @unchecked Sendable {
                     merged.quietUntil = theirQuiet
                     merged.refusalStreak = joining.refusalStreak
                 }
+            }
+            if let theirs = joining.lastOwnCloseAt {   // givo-1
+                merged.lastOwnCloseAt = merged.lastOwnCloseAt.map { max($0, theirs) } ?? theirs
             }
             merged.droppedTargets.formUnion(joining.droppedTargets)
             // Their waiters are parked on semaphores this bucket now owns; dropping them would hang
@@ -639,6 +647,28 @@ final class OriginRequestBudget: @unchecked Sendable {
         var state = origins[key] ?? OriginState()
         state.lastRefusalAt = instant
         origins[key] = state
+    }
+
+    /// givo-1: a connection to this origin was just ended by us (see `OriginState.lastOwnCloseAt`).
+    /// Kept on the books rather than on the reader because the next request is often another
+    /// reader's: a restart's fresh demuxer, or the next session's open right after a stop.
+    func noteOwnClose(for url: URL) {
+        guard let raw = Self.originKey(for: url) else { return }
+        let instant = now()
+        lock.lock(); defer { lock.unlock() }
+        let key = headLocked(raw)
+        var state = origins[key] ?? OriginState()
+        state.lastOwnCloseAt = instant
+        origins[key] = state
+    }
+
+    /// givo-1: seconds since this origin last saw one of our connections end at our hand, nil when
+    /// it never has.
+    func secondsSinceOwnClose(for url: URL) -> Double? {
+        guard let raw = Self.originKey(for: url) else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        guard let closed = origins[headLocked(raw)]?.lastOwnCloseAt else { return nil }
+        return Self.elapsedSeconds(from: closed, to: now())
     }
 
     /// True when this origin refused a request within `window`. The engine's revive arm asks this

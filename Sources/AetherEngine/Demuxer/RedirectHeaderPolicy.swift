@@ -25,7 +25,39 @@ enum RedirectHeaderPolicy {
         if credentialsAllowed(from: originalURL, to: redirectURL) {
             return extraHeaders
         }
-        return extraHeaders.filter { !credentialHeaders.contains($0.key.lowercased()) }
+        let carried = carriedHeaders(for: originalURL)   // givo-16
+        return extraHeaders.filter {
+            let name = $0.key.lowercased()
+            return !credentialHeaders.contains(name) || carried.contains(name)
+        }
+    }
+
+    // MARK: givo-16 carried identity headers
+
+    /// Header names (lowercased) a load declared to keep across a cross-origin redirect, keyed by the
+    /// origin of the URL it loaded (every redirect's original URL is that one).
+    nonisolated(unsafe) private static var carried: [String: Set<String>] = [:]
+    private static let carryLock = NSLock()
+
+    static func carryKey(for url: URL?) -> String? {
+        guard let url, let host = url.host?.lowercased(), let scheme = url.scheme?.lowercased() else { return nil }
+        let port = url.port ?? (scheme == "https" ? 443 : 80)
+        return "\(scheme)://\(host):\(port)"
+    }
+
+    /// Registers `names` for requests that originate at `source`'s origin; an empty list removes it.
+    static func setCarriedHeaders(_ names: [String], forSource source: URL?) {
+        guard let key = carryKey(for: source) else { return }
+        let set = Set(names.map { $0.lowercased() })
+        carryLock.lock()
+        if set.isEmpty { carried.removeValue(forKey: key) } else { carried[key] = set }
+        carryLock.unlock()
+    }
+
+    static func carriedHeaders(for original: URL?) -> Set<String> {
+        guard let key = carryKey(for: original) else { return [] }
+        carryLock.lock(); defer { carryLock.unlock() }
+        return carried[key] ?? []
     }
 
     /// Audit NET-7: the headers a host handed over for `anchor` as they may be sent to `target`, a URI
@@ -56,7 +88,8 @@ enum RedirectHeaderPolicy {
             updated.setValue(originalRange, forHTTPHeaderField: "Range")
         }
         if !credentialsAllowed(from: originalURL, to: request.url) {
-            for name in credentialHeaders {
+            let carried = carriedHeaders(for: originalURL)   // givo-16
+            for name in credentialHeaders where !carried.contains(name) {
                 updated.setValue(nil, forHTTPHeaderField: name)
             }
         }

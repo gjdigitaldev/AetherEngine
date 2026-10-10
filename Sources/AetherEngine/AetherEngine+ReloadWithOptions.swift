@@ -276,6 +276,7 @@ enum SessionOptionCorrection {
         "sequentialOrigin",
         "heldSourceConnection",
         "sharedOutputRole",
+        "carryIdentityHeadersAcrossRedirects",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -314,6 +315,10 @@ enum SessionOptionCorrection {
         // accepted and then not happen until something else reopened the source.
         if proposed.heldSourceConnection != current.heldSourceConnection {
             refused.append("heldSourceConnection")
+        }
+        // givo-16: registered when the load opened the source; a correction would never reach it.
+        if proposed.carryIdentityHeadersAcrossRedirects != current.carryIdentityHeadersAcrossRedirects {
+            refused.append("carryIdentityHeadersAcrossRedirects")
         }
         return refused
     }
@@ -400,7 +405,7 @@ enum SessionOptionCorrection {
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "firstSegmentTargetSeconds", "heldSourceMaxBitsPerSecond", "segmentCacheMaxBytes", "sourceDialDelaySeconds", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "firstSegmentTargetSeconds", "heldSourceMaxBitsPerSecond", "segmentCacheMaxBytes", "sourceDialDelaySeconds", "carryIdentityHeadersAcrossRedirects", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]

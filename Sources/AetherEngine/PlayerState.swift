@@ -852,6 +852,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// its own to wait behind. Capped at 10 s; nil (the default) dials at once.
     public var sourceDialDelaySeconds: Double? = nil
 
+    /// givo-16: header names (from `httpHeaders`, any case) that this load's requests keep across a
+    /// redirect to ANOTHER origin, where the engine otherwise drops credential headers (`Cookie`,
+    /// `Authorization`…) by design. For an origin that identifies a client by its whole header set
+    /// at every hop: a set-top-box portal's redirector 302s to a media host that refuses the request
+    /// (405) without the portal's `Cookie`. A listed `Accept-Encoding` is also sent as given on a held
+    /// connection, which otherwise asks for identity. Empty (the default) keeps the policy for every
+    /// other session. Names the session: a correction that changes it is refused.
+    public var carryIdentityHeadersAcrossRedirects: [String] = []
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on

@@ -215,7 +215,9 @@ final class HeldSourceConnection: @unchecked Sendable {
             // never down from https to http.
             let headers = RedirectHeaderPolicy.headersToReplay(
                 extraHeaders: extraHeaders, originalURL: source, redirectURL: target)
-            let head = try open(target, headers: headers)
+            // givo-16: a load that declared `Accept-Encoding` part of its identity sends it as given.
+            let keepsAcceptEncoding = RedirectHeaderPolicy.carriedHeaders(for: source).contains("accept-encoding")
+            let head = try open(target, headers: headers, keepsAcceptEncoding: keepsAcceptEncoding)
             if let location = Self.redirectLocation(head), hops < Self.maxRedirects {
                 guard let next = URL(string: location, relativeTo: target)?.absoluteURL else {
                     throw ConnectionError.malformedResponse("unresolvable Location: \(location)")
@@ -242,7 +244,7 @@ final class HeldSourceConnection: @unchecked Sendable {
     }
 
     /// Connect, write the request, and read until the head is complete.
-    private func open(_ target: URL, headers: [String: String]) throws -> ResponseHead {
+    private func open(_ target: URL, headers: [String: String], keepsAcceptEncoding: Bool = false) throws -> ResponseHead {
         guard let host = target.host, let scheme = target.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
             throw ConnectionError.unsupportedURL(target)
@@ -274,7 +276,7 @@ final class HeldSourceConnection: @unchecked Sendable {
 
         try write(Self.requestBytes(target: target, host: host, port: port, secure: secure,
                                     offset: offset, extraHeaders: headers,
-                                    userAgent: userAgent))
+                                    userAgent: userAgent, keepsAcceptEncoding: keepsAcceptEncoding))
         return try readHead()
     }
 
@@ -483,7 +485,8 @@ extension HeldSourceConnection {
                              secure: Bool,
                              offset: Int64,
                              extraHeaders: [String: String],
-                             userAgent: String?) throws -> Data {
+                             userAgent: String?,
+                             keepsAcceptEncoding: Bool = false) throws -> Data {
         // Audit DMX-4: the path goes on the wire as the URL spells it. `URL.path` is decoded, so
         // `%20`, `%3F` or `%2F` changed the resource asked for, a trailing slash was dropped, and a
         // `%0D%0A` in a redirect target became a raw line break in the request.
@@ -505,7 +508,9 @@ extension HeldSourceConnection {
         if let userAgent { lines.append("User-Agent: \(userAgent)") }
         // The caller's headers win: they carry the source's authentication, and a duplicate of a
         // header set above would be sent twice.
-        let reserved = Set(["host", "range", "connection", "accept-encoding"])
+        let reserved: Set<String> = keepsAcceptEncoding   // givo-16
+            ? ["host", "range", "connection"]
+            : ["host", "range", "connection", "accept-encoding"]
         for (name, value) in extraHeaders where !reserved.contains(name.lowercased()) {
             lines.removeAll { $0.lowercased().hasPrefix(name.lowercased() + ":") }
             lines.append("\(name): \(value)")

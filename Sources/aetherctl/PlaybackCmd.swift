@@ -540,7 +540,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         }
         .store(in: &cancellables)
 
-    let options = LoadOptions(
+    var options = LoadOptions(
         suppressDisplayCriteria: true,
         httpHeaders: httpHeaders,
         // AE#493: the Dolby Vision claim a macOS host has to make itself, because there is no per-mode
@@ -585,6 +585,11 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         preferredDecodePath: forceSoftware ? .software : .automatic,
         escalatesToSoftwarePath: softwareEscalation
     )
+    // givo-16: `AETHERCTL_CARRY_HEADERS=Cookie,X-User-Agent` keeps those of the --header set across a
+    // cross-origin redirect (a set-top-box portal's redirector), the load option a host sets.
+    if let carry = ProcessInfo.processInfo.environment["AETHERCTL_CARRY_HEADERS"] {
+        options.carryIdentityHeadersAcrossRedirects = carry.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
     // AE#629: the rescue a host used to see only as a route change.
     let escalationSub = engine.softwarePathEscalations.sink { event in
         let failure = event.absorbedFailure

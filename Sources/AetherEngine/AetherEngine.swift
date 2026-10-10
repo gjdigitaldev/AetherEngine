@@ -360,6 +360,23 @@ public final class AetherEngine: ObservableObject {
         }.value
     }
 
+    /// givo-16: the source whose origin the current load registered carried headers for.
+    private static let carriedSourceKey = NSLock()
+    nonisolated(unsafe) private static var carriedSources: [ObjectIdentifier: URL] = [:]
+
+    /// givo-16: one registration per engine: the previous load's goes, this load's (if any) comes.
+    func registerCarriedIdentityHeaders(_ names: [String], source: URL?) {
+        let id = ObjectIdentifier(self)
+        Self.carriedSourceKey.lock()
+        let previous = Self.carriedSources.removeValue(forKey: id)
+        if let source, !names.isEmpty { Self.carriedSources[id] = source }
+        Self.carriedSourceKey.unlock()
+        if let previous { RedirectHeaderPolicy.setCarriedHeaders([], forSource: previous) }
+        guard let source, !names.isEmpty else { return }
+        RedirectHeaderPolicy.setCarriedHeaders(names, forSource: source)
+        EngineLog.emit("[AetherEngine] givo-16: \(names.count) identity header(s) kept across cross-origin redirects for this load", category: .engine)
+    }
+
     /// givo-15: whether a seek on a sequential origin lands inside the produced, cached spans, with half a
     /// second of what was read still ahead of it so the item has something to start on.
     nonisolated static func sequentialSeekIsResident(target: Double, resident: [ClosedRange<Double>]) -> Bool {
@@ -4249,6 +4266,9 @@ public final class AetherEngine: ObservableObject {
         // Audit CORE-6: the first suspension point. Two loads issued back to back right after init
         // both wait on the same category task, and the older one must not resume as the current one.
         try checkLoadCurrent(gen)
+        // givo-16: this load's identity headers survive a cross-origin redirect (the previous load's
+        // registration is replaced, so it cannot reach this source).
+        registerCarriedIdentityHeaders(options.carryIdentityHeadersAcrossRedirects, source: url)
         // givo-8: the previous session's source request closed in the teardown above; an origin that
         // keeps counting a closed connection for a moment gets that moment before this load dials.
         if let delay = options.sourceDialDelaySeconds, delay > 0, delay.isFinite {
@@ -6382,6 +6402,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
+        registerCarriedIdentityHeaders([], source: nil)   // givo-16
         cancelPendingAudioSelection()
         releaseHeldPicture(reason: "stop")
         nextLoadRequestsInPlaceItemHandover = false

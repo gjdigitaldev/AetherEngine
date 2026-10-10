@@ -55,6 +55,50 @@ struct EngineSessionRedirectCredentialTests {
         expectScrubbed(seen)
     }
 
+    /// givo-16: a set-top-box portal's redirector 302s to a media host that refuses the request (405)
+    /// without the portal's Cookie. A load that declares its identity headers keeps them across that
+    /// hop; every other load keeps the scrub above.
+    @Test("a load's declared identity headers reach the cross-origin target, an undeclared load's do not",
+          arguments: [false, true], [false, true])
+    func declaredIdentityHeadersCrossTheRedirect(held: Bool, declared: Bool) async throws {
+        let target = try #require(ThrottledOriginServer(totalSize: 4 * 1024 * 1024))
+        let targetPort = target.port
+        let sourceMaybe = ThrottledOriginServer(
+            totalSize: 4 * 1024 * 1024,
+            respond: { _, _, _ in .redirect(to: "http://127.0.0.1:\(targetPort)/media/movie.ts") })
+        let source = try #require(sourceMaybe)
+        defer { source.stop(); target.stop() }
+
+        let url = try #require(URL(string: "http://127.0.0.1:\(source.port)/portal/play.ts"))
+        let identity = ["Cookie": "mac=00:1A:79:00:00:01; stb_lang=en", "X-User-Agent": "Model: MAG250",
+                        "Accept-Encoding": "gzip, deflate"]
+        RedirectHeaderPolicy.setCarriedHeaders(declared ? ["Cookie", "X-User-Agent", "Accept-Encoding"] : [],
+                                               forSource: url)
+        defer { RedirectHeaderPolicy.setCarriedHeaders([], forSource: url) }
+
+        let reader = AVIOReader(url: url, extraHeaders: identity, heldConnection: held)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+        defer { buf.deallocate() }
+        #expect(reader.read(into: buf, size: 4096) > 0)
+
+        let atTarget = target.requestHeaders
+        #expect(!atTarget.isEmpty, "nothing reached the media host")
+        for seen in atTarget {
+            #expect(seen["x-user-agent"] == "Model: MAG250", "a non-credential header is always replayed")
+            if declared {
+                #expect(seen["cookie"] == identity["Cookie"], "the declared Cookie was dropped at the hop")
+            } else {
+                #expect(seen["cookie"] == nil, "an undeclared Cookie crossed the hop")
+            }
+        }
+        if held, declared {
+            #expect(atTarget.contains { $0["accept-encoding"] == "gzip, deflate" },
+                    "a declared Accept-Encoding goes out as given on a held connection")
+        }
+    }
+
     /// The relay's `UpstreamPump` shape: a per-task delegate that answers the body callbacks and has
     /// no redirect method of its own, so the session-level one has to answer for it.
     @Test("a task delegate without a redirect method falls back to the session's rule")

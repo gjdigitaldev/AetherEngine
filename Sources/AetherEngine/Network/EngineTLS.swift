@@ -31,6 +31,17 @@ public enum EngineTLS {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var _evaluator: (@Sendable (URLProtectionSpace) -> Bool)?
 
+    /// givo-10: every redirect an engine request is about to follow, as (the request's original
+    /// URL, the next hop), before the hop is requested. A host that answers `serverTrustEvaluator`
+    /// for one origin can then answer for the hosts that origin redirects to, and for no other.
+    /// Called off the main actor from the session's delegate queue, so it has to be thread-safe;
+    /// nil, the default, costs one locked read per redirect.
+    public static var redirectObserver: (@Sendable (_ original: URL?, _ target: URL) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _redirectObserver }
+        set { lock.lock(); _redirectObserver = newValue; lock.unlock() }
+    }
+    nonisolated(unsafe) private static var _redirectObserver: (@Sendable (_ original: URL?, _ target: URL) -> Void)?
+
     /// Session-level delegate for the owned sessions that otherwise run
     /// without one (disc reader, HLS ingest readers, audio tap fetcher,
     /// carriage probe, subtitle proxy, live rendition fetch) and the fallback

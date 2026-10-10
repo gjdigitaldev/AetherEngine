@@ -162,4 +162,29 @@ struct RedirectHeaderPolicyTests {
         #expect(out.value(forHTTPHeaderField: "X-Custom") == "1")
         #expect(out.value(forHTTPHeaderField: "Range") == "bytes=1024-")
     }
+
+    // givo-10: the host learns every hop before it is requested, so a trust answer scoped to one
+    // origin can follow that origin's redirects.
+    @Test("Every redirect reaches the host's observer before the hop is requested")
+    func redirectObserverSeesTheHop() {
+        final class Seen: @unchecked Sendable {
+            let lock = NSLock()
+            var hops: [(URL?, URL)] = []
+        }
+        let seen = Seen()
+        EngineTLS.redirectObserver = { original, target in
+            guard target.host == "edge.givo-10.example" else { return }
+            seen.lock.lock(); seen.hops.append((original, target)); seen.lock.unlock()
+        }
+        defer { EngineTLS.redirectObserver = nil }
+        _ = RedirectHeaderPolicy.redirectRequest(
+            URLRequest(url: url("https://edge.givo-10.example/movie/42.mkv")),
+            originalURL: url("https://panel.givo-10.example/movie/u/p/42.mkv"),
+            originalRange: nil,
+            extraHeaders: [:])
+        seen.lock.lock(); defer { seen.lock.unlock() }
+        #expect(seen.hops.count == 1)
+        #expect(seen.hops.first?.0?.host == "panel.givo-10.example")
+        #expect(seen.hops.first?.1.host == "edge.givo-10.example")
+    }
 }

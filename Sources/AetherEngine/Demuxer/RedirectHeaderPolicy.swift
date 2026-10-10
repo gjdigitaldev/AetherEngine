@@ -49,6 +49,8 @@ enum RedirectHeaderPolicy {
         originalRange: String?,
         extraHeaders: [String: String]
     ) -> URLRequest {
+        // givo-10: every redirect the engine follows passes here, before the hop is requested.
+        if let target = request.url { EngineTLS.redirectObserver?(originalURL, target) }
         var updated = request
         if let originalRange {
             updated.setValue(originalRange, forHTTPHeaderField: "Range")

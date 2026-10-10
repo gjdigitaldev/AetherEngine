@@ -59,6 +59,15 @@ final class SourceURLRefresh: @unchecked Sendable {
         condition.unlock()
     }
 
+    /// givo-29: true when a refresh asked now would reach the host: a refresher is registered, the
+    /// guard has not tripped, and the last `window` holds fewer than `maxRefreshes`. A caller that
+    /// gives something up for the fresh address (a dial it closes first) asks this, not `canRefresh`.
+    func canRefreshNow(_ source: URL, now: Date = Date()) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        guard let entry = entries[source.absoluteString], !entry.exhausted, !entry.inFlight else { return false }
+        return entry.stamps.filter { now.timeIntervalSince($0) < Self.window }.count < Self.maxRefreshes
+    }
+
     /// The address `source` reads from now, nil when it was never refreshed.
     func current(for source: URL) -> URL? {
         condition.lock(); defer { condition.unlock() }

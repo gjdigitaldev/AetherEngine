@@ -167,4 +167,62 @@ struct SourceURLRefreshTests {
         #expect(OriginRequestBudget.shared.limit(for: url) == nil, "nor teaches the origin a limit")
         #expect(elapsed < 6, "one quick retry and a refresh, not the ladder (took \(elapsed)s)")
     }
+
+    @Test("an open whose first dial never answers dials a fresh address at the 5 s mark, and never the dead one again (givo-29)",
+          .timeLimit(.minutes(2)))
+    func deadFirstDialOpensOnAFreshAddress() async throws {
+        let serverMaybe = ThrottledOriginServer(
+            totalSize: 16 * 1024 * 1024, chunkBytes: 64 * 1024, throttleUs: 0,
+            respond: { _, _, path in path.hasPrefix("/old") ? .neverAnswer : .serve206 })
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+        let url = URL(string: "http://127.0.0.1:\(server.port)/old/movie.ts")!
+        let fresh = URL(string: "http://127.0.0.1:\(server.port)/new/movie.ts")!
+        let asked = Counter()
+        SourceURLRefresh.shared.register(SourceURLRefresher { _ in _ = asked.next(); return fresh }, for: url)
+        defer { SourceURLRefresh.shared.register(nil, for: url) }
+
+        let reader = AVIOReader(url: url, heldConnection: true)
+        defer { reader.markClosed(); reader.close() }
+        let started = Date()
+        try reader.open()
+        let elapsed = Date().timeIntervalSince(started)
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
+        defer { buf.deallocate() }
+        #expect(reader.read(into: buf, size: 65536) > 0)
+        #expect(elapsed >= AVIOReader.deadDialMarkSeconds - 0.2 && elapsed < AVIOReader.deadDialMarkSeconds + 5,
+                "opened at the mark plus a dial: \(elapsed)")
+        #expect(asked.count == 1)
+        #expect(server.requestLog.filter { $0.path.hasPrefix("/old") && $0.start == 0 }.count == 1,
+                "the dead link is dialed once: \(server.requestLog)")
+    }
+
+    @Test("an open whose first dial answers never asks for a fresh address (givo-29)", .timeLimit(.minutes(1)))
+    func answeredFirstDialIsUntouched() async throws {
+        let serverMaybe = ThrottledOriginServer(
+            totalSize: 16 * 1024 * 1024, chunkBytes: 64 * 1024, throttleUs: 0, respond: { _, _, _ in .serve206 })
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+        let url = URL(string: "http://127.0.0.1:\(server.port)/old/movie.ts")!
+        let asked = Counter()
+        SourceURLRefresh.shared.register(SourceURLRefresher { _ in _ = asked.next(); return url }, for: url)
+        defer { SourceURLRefresh.shared.register(nil, for: url) }
+        let reader = AVIOReader(url: url, heldConnection: true)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        #expect(asked.count == 0)
+    }
+
+    @Test("a refresh is not offered once three are in the window (givo-29)")
+    func canRefreshNowHonoursTheWindow() {
+        let url = URL(string: "http://127.0.0.1:1/budget/movie.ts")!
+        SourceURLRefresh.shared.register(SourceURLRefresher { _ in url }, for: url)
+        defer { SourceURLRefresh.shared.register(nil, for: url) }
+        #expect(SourceURLRefresh.shared.canRefreshNow(url))
+        for _ in 0..<SourceURLRefresh.maxRefreshes {
+            _ = SourceURLRefresh.shared.refresh(source: url, timeout: 2, shouldAbort: { false })
+        }
+        #expect(!SourceURLRefresh.shared.canRefreshNow(url))
+        #expect(!SourceURLRefresh.shared.canRefreshNow(URL(string: "http://127.0.0.1:1/unregistered.ts")!))
+    }
 }

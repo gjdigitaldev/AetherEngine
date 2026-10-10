@@ -36,6 +36,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// Audit DMX-101: a server that cannot address bytes. Whatever range was asked for, the
         /// answer is a 200 with the whole source from byte 0 and its full Content-Length.
         case serve200
+        /// givo-29: take the request and never answer it, until the client closes: a portal's media
+        /// front holding a dial dead.
+        case neverAnswer
     }
 
     let port: UInt16
@@ -310,6 +313,13 @@ final class ThrottledOriginServer: @unchecked Sendable {
         case .dropConnection:
             // Returning false ends `serve`, which closes the fd exactly once.
             shutdown(fd, SHUT_RDWR)
+            return false
+        case .neverAnswer:
+            var probe: UInt8 = 0
+            while !stopped {
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                if poll(&pfd, 1, 100) > 0, recv(fd, &probe, 1, MSG_PEEK) <= 0 { break }
+            }
             return false
         }
 

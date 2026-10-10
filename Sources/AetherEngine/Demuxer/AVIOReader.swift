@@ -539,9 +539,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// givo-20: ask the host for a fresh address and, given one, read on from it: the pin (the old
     /// address's post-redirect target) goes, the lineage gets its retries back, and the next dial goes
     /// out at once. Blocks the read thread while the host mints (its cooldown included).
-    private func refreshSourceAddress() -> SourceURLRefresh.Outcome {
-        EngineLog.emit("[AVIOReader] \(label) the origin ended our connection and refuses the reconnect; "
-                       + "asking the host for a fresh source address (givo-20)", category: .demux)
+    private func refreshSourceAddress(
+        reason: String = "the origin ended our connection and refuses the reconnect"
+    ) -> SourceURLRefresh.Outcome {
+        EngineLog.emit("[AVIOReader] \(label) \(reason); asking the host for a fresh source address (givo-20)",
+                       category: .demux)
         let outcome = SourceURLRefresh.shared.refresh(
             source: url, timeout: Self.sourceRefreshTimeoutSeconds,
             shouldAbort: { [weak self] in self?.isClosed ?? true })
@@ -1435,7 +1437,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 rangeVerdictPending = !isLive
                 winCond.unlock()
                 startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
-                var opened = awaitFirstPersistentData()
+                var opened = awaitOpenFirstData()   // givo-29
                 // givo-1: an open sent right after our own close (a stop and a reopen, a restart's
                 // fresh demuxer) refused for the connection that just ended: the same one retry.
                 if !opened, !isLive, let retryAt = selfCausedRefusalOfOpenConnection() {
@@ -1658,6 +1660,69 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return gotData
     }
 
+    /// givo-29: how long the open's first dial may go without any response before a host that mints
+    /// addresses is asked for a fresh one. The same mark the reader already reports a missing first
+    /// byte at.
+    static let deadDialMarkSeconds: TimeInterval = 5
+
+    /// givo-29: the open's first dial, with the dead-dial rule. A portal's media front can take the
+    /// dial and never answer it, and then counts it: the open's data retry on the same link waited
+    /// 9.4 s and got 509 (Apple TV field, p12), and the session sat 28 s before the app minted a new
+    /// link. With a refresher registered, a dial that has had no response at all by the mark is
+    /// closed, the host mints a fresh address, and the open dials that one; the link that never
+    /// answered is not dialed again. Anything that answered (data, a status, an end) keeps today's
+    /// paths.
+    private func awaitOpenFirstData() -> Bool {
+        let budget = sourceOpenPolicy.firstByteTimeout
+        guard !isLive, budget > Self.deadDialMarkSeconds, SourceURLRefresh.shared.canRefreshNow(url) else {
+            return awaitFirstPersistentData()
+        }
+        if awaitFirstPersistentData(timeout: Self.deadDialMarkSeconds) { return true }
+        winCond.lock()
+        let unanswered = connStatus == 0 && !connEnded && window.isEmpty
+        winCond.unlock()
+        guard !isClosed, unanswered else {
+            return isClosed ? false : awaitFirstPersistentData(timeout: budget - Self.deadDialMarkSeconds)
+        }
+        guard SourceURLRefresh.shared.canRefreshNow(url) else {
+            return awaitFirstPersistentData(timeout: budget - Self.deadDialMarkSeconds)
+        }
+        closeUnansweredDial()
+        let outcome = refreshSourceAddress(
+            reason: "the open's first dial had no response after \(Int(Self.deadDialMarkSeconds)) s; closed it, "
+                + "and it is not dialed again (givo-29)")
+        guard case .refreshed = outcome, !isClosed else {
+            EngineLog.emit("[SourceOpen] reader=\(openDiagnosticID) phase=fresh-address result=none; the open's "
+                           + "unanswered-dial retry takes it from here (givo-29)", category: .demux)
+            return false
+        }
+        winCond.lock()
+        rangeVerdictPending = true
+        winCond.unlock()
+        openDialedFreshAddress = true
+        startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+        return awaitFirstPersistentData(phase: "first-data-fresh")
+    }
+
+    /// givo-29: the open closed an unanswered dial and dialed a fresh address. If that one does not
+    /// answer either, it is not dialed again: the open fails, and the host's own recovery runs sooner.
+    private var openDialedFreshAddress = false
+
+    /// givo-29: end the current dial without starting another: its late callbacks belong to a retired
+    /// generation, and its origin slot goes back at once.
+    private func closeUnansweredDial() {
+        winCond.lock()
+        connGeneration &+= 1
+        connEnded = true
+        let transfer = activeTransfer
+        activeTransfer = nil
+        winCond.broadcast()
+        winCond.unlock()
+        transfer?.cancelTransfer()
+        transfer?.releaseOriginTicket()
+        SourceAddressBook.shared.noteClosed(sourceURL())
+    }
+
     /// A timeout is not evidence that the origin cannot seek. Retry the data request once,
     /// using the alternate open-ended Range shape, and keep its body for playback. Metadata-only
     /// probes would discard that body and open yet another connection, or silently downgrade an
@@ -1673,6 +1738,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard unanswered else { return gotData }
         // A trust failure cannot be repaired by changing the Range header.
         try failIfStreamingRefused(fallbackStatus: 0)
+        if openDialedFreshAddress {
+            EngineLog.emit("[SourceOpen] reader=\(openDiagnosticID) phase=failed reason=no-response the fresh address "
+                           + "did not answer either; not dialing it again (givo-29)", category: .demux)
+            markClosed()
+            close()
+            throw AVIOReaderError.requestTimeout
+        }
         EngineLog.emit("[SourceOpen] reader=\(openDiagnosticID) phase=data-retry reason=no-response budget=\(sourceOpenPolicy.sizeProbeTimeout)s", category: .demux)
         startPersistentConnection(at: 0, openEnded: true)
         let recovered = awaitFirstPersistentData(timeout: sourceOpenPolicy.sizeProbeTimeout,

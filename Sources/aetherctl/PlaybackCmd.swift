@@ -591,6 +591,18 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     if ProcessInfo.processInfo.environment["AETHERCTL_PROGRESSIVE_AFTER_SEEK"] == "1" {
         options.progressiveSegmentDeliveryAfterSeek = true
     }
+    // givo-29 lab: `AETHERCTL_REFRESH_URL` registers a host refresher that mints the template with `{n}`
+    // replaced by 1, 2, ... (`none`: a refresher that never has an address).
+    if let template = ProcessInfo.processInfo.environment["AETHERCTL_REFRESH_URL"] {
+        let minted = MintCounter()
+        options.sourceURLRefresher = SourceURLRefresher { _ in
+            guard template != "none" else { return nil }
+            let n = minted.next()
+            let url = URL(string: template.replacingOccurrences(of: "{n}", with: String(n)))
+            print("  HOST minted fresh address #\(n)")
+            return url
+        }
+    }
     // givo-28: `AETHERCTL_KEYFRAME_WHEN_SLOW=1` lands a seek on its keyframe on a slow link.
     if ProcessInfo.processInfo.environment["AETHERCTL_KEYFRAME_WHEN_SLOW"] == "1" {
         options.seekLandsOnKeyframeWhenSlow = true
@@ -1880,4 +1892,11 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
           + " picked=\(offsets[startIndex...].prefix(2).map(\.name).joined(separator: ",")) "
           + "of=\(offsets.count) relative=\(String(format: "%.1f", relative)) playhead=\(String(format: "%.1f", playhead))"
           + (checked > 0 && nonEmpty == 0 ? "   <- a caption box with nothing in it" : ""))
+}
+
+/// givo-29 lab: the mint count the `AETHERCTL_REFRESH_URL` refresher hands out.
+final class MintCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    func next() -> Int { lock.lock(); defer { lock.unlock() }; n += 1; return n }
 }

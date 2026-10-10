@@ -120,7 +120,10 @@ final class SourceURLRefresh: @unchecked Sendable {
         if var done = entries[key], done.refresher == refresher {
             done.inFlight = false
             done.lastOutcome = outcome
-            if case .refreshed(let fresh) = outcome { done.current = fresh }
+            if case .refreshed(let fresh) = outcome {
+                done.current = fresh
+                SourceAddressBook.shared.noteReceived(fresh)   // givo-23
+            }
             entries[key] = done
         }
         condition.broadcast()
@@ -145,5 +148,63 @@ final class SourceURLRefresh: @unchecked Sendable {
             if !answered { _ = condition.wait(until: Date().addingTimeInterval(slice)) }
             return answered ? .some(value) : nil
         }
+    }
+}
+
+/// givo-23: what the field logs need to tell a link's lifetime from a connection's: for every source
+/// address the engine reads, when it received the address, how many connections it has opened on it
+/// and when the last one ended. Diagnostics only; nothing decides on it.
+final class SourceAddressBook: @unchecked Sendable {
+    static let shared = SourceAddressBook()
+
+    private struct Entry {
+        var receivedAt: Date
+        var connections = 0
+        var lastCloseAt: Date?
+    }
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+    private static let capacity = 32
+
+    /// A load or a refresh handed the engine `url`: its clock starts now.
+    func noteReceived(_ url: URL) {
+        let key = url.absoluteString
+        lock.lock(); defer { lock.unlock() }
+        entries[key] = Entry(receivedAt: Date())
+        order.removeAll { $0 == key }
+        order.append(key)
+        while order.count > Self.capacity { entries.removeValue(forKey: order.removeFirst()) }
+    }
+
+    /// A connection to `url` is starting; returns its description for the line that reports it.
+    func noteConnection(_ url: URL) -> String {
+        let key = url.absoluteString
+        lock.lock(); defer { lock.unlock() }
+        guard var entry = entries[key] else { return "address age unknown" }
+        entry.connections += 1
+        entries[key] = entry
+        return Self.describe(entry, now: Date())
+    }
+
+    func noteClosed(_ url: URL) {
+        let key = url.absoluteString
+        lock.lock(); defer { lock.unlock() }
+        entries[key]?.lastCloseAt = Date()
+    }
+
+    func describe(_ url: URL) -> String {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[url.absoluteString] else { return "address age unknown" }
+        return Self.describe(entry, now: Date())
+    }
+
+    private static func describe(_ entry: Entry, now: Date) -> String {
+        var text = String(format: "address received %.1f s ago, connection %d on it", now.timeIntervalSince(entry.receivedAt), entry.connections)
+        if let closed = entry.lastCloseAt {
+            text += String(format: ", the previous one on it ended %.1f s before", now.timeIntervalSince(closed))
+        }
+        return text
     }
 }

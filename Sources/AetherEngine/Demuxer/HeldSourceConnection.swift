@@ -117,6 +117,9 @@ final class HeldSourceConnection: @unchecked Sendable {
     private var bodyBytes: Int64 = 0
     private var lastDataAt: Date?
     private var lastParkSeconds: Double = 0
+    /// givo-23: the source address's age and connection count when this connection started.
+    private let addressNote: String
+    private var connectStartedAt: Date?
 
     init(url: URL,
          offset: Int64,
@@ -125,7 +128,9 @@ final class HeldSourceConnection: @unchecked Sendable {
          label: String,
          generation: Int = 0,
          ticket: OriginRequestBudget.Ticket? = nil,
+         addressNote: String = "",
          delegate: HeldSourceConnectionDelegate) {
+        self.addressNote = addressNote   // givo-23
         self.respondedBy = url
         self.offset = offset
         self.extraHeaders = extraHeaders
@@ -211,6 +216,7 @@ final class HeldSourceConnection: @unchecked Sendable {
     }
 
     private func openAndPump() throws {
+        connectStartedAt = Date()   // givo-23
         let source = respondedBy
         var target = respondedBy
         var hops = 0
@@ -325,8 +331,10 @@ final class HeldSourceConnection: @unchecked Sendable {
                     let sinceData = lastDataAt.map { now.timeIntervalSince($0) } ?? lived
                     EngineLog.emit("[HeldSourceConnection] gen=\(generation) the origin closed the connection with "
                                    + "\(remaining / 1024)KB of the body still due, after "
-                                   + String(format: "%.1f s and %.1f MB (last data %.1f s before; the reader had held its last read back %.1f s)",
-                                            lived, Double(bodyBytes) / 1_048_576, sinceData, lastParkSeconds),
+                                   + String(format: "%.1f s and %.1f MB (last data %.1f s before; the reader had held its last read back %.1f s; first byte %.2f s after the dial",
+                                            lived, Double(bodyBytes) / 1_048_576, sinceData, lastParkSeconds,
+                                            bodyStartedAt.flatMap { b in connectStartedAt.map { b.timeIntervalSince($0) } } ?? -1)
+                                   + (addressNote.isEmpty ? ")" : "; \(addressNote))"),   // givo-23
                                    category: .demux)
                 }
                 return nil

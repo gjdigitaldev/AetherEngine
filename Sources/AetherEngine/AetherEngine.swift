@@ -4290,6 +4290,7 @@ public final class AetherEngine: ObservableObject {
         // registration is replaced, so it cannot reach this source).
         registerCarriedIdentityHeaders(options.carryIdentityHeadersAcrossRedirects, source: url)
         registerSourceURLRefresher(options.sourceURLRefresher, source: url)   // givo-20
+        SourceAddressBook.shared.noteReceived(url)   // givo-23
         // givo-8: the previous session's source request closed in the teardown above; an origin that
         // keeps counting a closed connection for a moment gets that moment before this load dials.
         if let delay = options.sourceDialDelaySeconds, delay > 0, delay.isFinite {

@@ -3469,6 +3469,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             sleepUntilSelfCausedRetry(Date().addingTimeInterval(release))
             if isClosed { return }
         }
+        // givo-23: this connection's place on its source address, for the lines that report on it.
+        let connectionAddressNote = SourceAddressBook.shared.noteConnection(sourceURL())
 
         var request = URLRequest(url: requestURL())
         // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
@@ -3513,6 +3515,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 label: label,
                 generation: generation,
                 ticket: ticket,
+                addressNote: connectionAddressNote,   // givo-23
                 delegate: self
             )
         } else {
@@ -3862,20 +3865,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 EngineLog.emit(
                     "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(selfCaused.since * 1000))ms after "
                     + "the origin ended our last connection: it still counts it; retry \(n) of "
-                    + "\(Self.faultedRetryDelaysSeconds.count) in \(delayText)s before the ladder (givo-11)",
+                    + "\(Self.faultedRetryDelaysSeconds.count) in \(delayText)s before the ladder (givo-11) (\(SourceAddressBook.shared.describe(sourceURL())))",
                     category: .demux)
             } else if selfCaused.delay == 0 {
                 emitNetworkPhase(.reconnecting)   // givo-21: the source is down while the host mints
                 EngineLog.emit(
                     "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(selfCaused.since * 1000))ms after our "
                     + "last connection ended and the quick retry was refused too: asking the host for a fresh "
-                    + "address, nothing charged (givo-21)",
+                    + "address, nothing charged (givo-21) (\(SourceAddressBook.shared.describe(sourceURL())))",
                     category: .demux)
             } else {
                 EngineLog.emit(
                     "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(selfCaused.since * 1000))ms after our "
                     + "last connection ended: the origin still counts it; one retry in "
-                    + "\(delayText)s before the ladder (givo-1)",
+                    + "\(delayText)s before the ladder (givo-1) (\(SourceAddressBook.shared.describe(sourceURL())))",
                     category: .demux)
             }
         } else if Self.isRateLimitStatus(status) {
@@ -4001,6 +4004,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if status != 200 {
             EngineLog.emit(
                 "[AVIOReader] \(label) gen=\(generation) rejected response status=\(status) at offset \(requestedOffset)"
+                + " (\(SourceAddressBook.shared.describe(sourceURL())))"   // givo-23
                     + respondingTargetDescription(respondedBy)
                     + (retryAfter > 0 ? " retryAfter=\(Int(retryAfter))s" : ""),
                 category: .demux
@@ -4015,6 +4019,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     fileprivate func persistentConnectionEnded(error: Error?, generation: Int) {
+        SourceAddressBook.shared.noteClosed(sourceURL())   // givo-23
         winCond.lock()
         let isCurrentGen = (generation == connGeneration)
         if isCurrentGen {

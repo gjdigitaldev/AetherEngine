@@ -124,4 +124,47 @@ struct SourceURLRefreshTests {
         #expect(reader.read(into: buf, size: Int32(slice)) > 0)
         #expect(Date().timeIntervalSince(began) >= 0.7, "the dial after our own close waited the release time")
     }
+
+    /// givo-21: after our OWN close (a seek), a front that refuses the dial and its quick retry gets
+    /// replaced by a fresh address at once, and nothing is charged: in the field a pacer armed by the
+    /// old link's refusals made the fresh link wait 5.9 s for a slot.
+    @Test("a seek's dial refused twice after our own close reads on from a fresh address, uncharged",
+          .timeLimit(.minutes(2)))
+    func ownCloseRefusalsGoStraightToAFreshAddress() async throws {
+        let target: Int64 = 48 * 1024 * 1024
+        let serverMaybe = ThrottledOriginServer(
+            totalSize: 96 * 1024 * 1024, chunkBytes: 64 * 1024, throttleUs: 20_000,
+            respond: { _, offset, path in
+                if path.hasPrefix("/old"), offset == target { return .status(509) }   // the old link, counted
+                return .serve206
+            })
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+        let url = URL(string: "http://127.0.0.1:\(server.port)/old/movie.ts")!
+        let fresh = URL(string: "http://127.0.0.1:\(server.port)/new/movie.ts")!
+        let asked = Counter()
+        SourceURLRefresh.shared.register(SourceURLRefresher { _ in _ = asked.next(); return fresh }, for: url)
+        defer { SourceURLRefresh.shared.register(nil, for: url) }
+
+        let reader = AVIOReader(url: url, heldConnection: true)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        let slice = 64 * 1024
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: slice)
+        defer { buf.deallocate() }
+        #expect(reader.read(into: buf, size: Int32(slice)) > 0)
+
+        #expect(reader.seek(offset: target, whence: SEEK_SET) == target)
+        let began = Date()
+        #expect(reader.read(into: buf, size: Int32(slice)) > 0, "the seek's read must be served")
+        let elapsed = Date().timeIntervalSince(began)
+
+        #expect(asked.count == 1, "one fresh address: \(asked.count)")
+        let oldAtTarget = server.requestLog.filter { $0.path.hasPrefix("/old") && $0.start == target }.count
+        #expect(oldAtTarget == 2, "the refusal and its one quick retry, then the fresh link: \(server.requestLog)")
+        #expect(server.requestLog.contains { $0.path.hasPrefix("/new") && $0.start == target })
+        #expect(!OriginRequestBudget.shared.isPaced(url), "nothing in this lineage arms the pacer")
+        #expect(OriginRequestBudget.shared.limit(for: url) == nil, "nor teaches the origin a limit")
+        #expect(elapsed < 6, "one quick retry and a refresh, not the ladder (took \(elapsed)s)")
+    }
 }

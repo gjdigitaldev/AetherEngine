@@ -424,6 +424,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the budget or the pacer) before the ladder. A close we decided ourselves is released in about
     /// a second and keeps givo-1's single retry.
     static let faultedRetryDelaysSeconds: [TimeInterval] = [1, 2, 4, 8]
+    /// givo-21: with a host that mints fresh addresses, a slot refusal this soon after our own close is
+    /// still ours: the dial may have waited for a slot first, so the window is wider than givo-1's.
+    static let refreshableOwnCloseWindowSeconds: TimeInterval = 10
     static let faultedRefusalWindowSeconds: TimeInterval = 16
 
     /// Hard server errors answered by a pinned post-redirect URL: the redirect target
@@ -481,9 +484,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         defer { winCond.unlock() }
         guard generation == connGeneration else { return nil }
-        let delay: TimeInterval
+        var delay: TimeInterval
         let sinceEnd: Double
         var faultRetry: Int? = nil
+        // givo-21: a host that can mint a fresh address gets one quick retry after ANY close, then the
+        // fresh address at once, and nothing in between is charged: the old link's refusals are not a
+        // verdict on the origin, and a pacer armed by them made the fresh link queue for a slot.
+        let refreshable = !sourceRefreshExhausted && SourceURLRefresh.shared.canRefresh(url)
         if let faultedAt = faultedLineageAt, faultedRetriesUsed < Self.faultedRetryDelaysSeconds.count,
            Date().timeIntervalSince(faultedAt) <= Self.faultedRefusalWindowSeconds {
             delay = Self.faultedRetryDelaysSeconds[faultedRetriesUsed] * backoffScale
@@ -491,14 +498,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             faultRetry = faultedRetriesUsed
             sinceEnd = Date().timeIntervalSince(faultedAt)
             // givo-20: the first retry was refused too; a host that can mint a fresh address is asked now.
-            if faultedRetriesUsed >= 2, !sourceRefreshExhausted, SourceURLRefresh.shared.canRefresh(url) {
+            if faultedRetriesUsed >= 2, refreshable {
                 sourceRefreshDue = true
             }
-        } else {
-            guard let since, since <= Self.selfCausedRefusalWindowSeconds, !selfCausedRetrySpent else { return nil }
+        } else if let since, since <= (refreshable ? Self.refreshableOwnCloseWindowSeconds : Self.selfCausedRefusalWindowSeconds),
+                  !selfCausedRetrySpent {
             delay = Self.selfCausedRetryDelaySeconds * backoffScale
             sinceEnd = since
+        } else if let since, refreshable, selfCausedRetrySpent,
+                  since <= Self.refreshableOwnCloseWindowSeconds + Self.selfCausedRetryDelaySeconds * backoffScale {
+            // givo-21: the quick retry after our own close was refused too: the fresh address, now.
+            delay = 0
+            sinceEnd = since
+            sourceRefreshDue = true
+        } else {
+            return nil
         }
+        if sourceRefreshDue { delay = 0 }   // givo-21: the refresh replaces the wait
         selfCausedRetrySpent = true
         connSelfCausedRefusal = true
         selfCausedRetryAt = Date().addingTimeInterval(delay)
@@ -3847,6 +3863,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(selfCaused.since * 1000))ms after "
                     + "the origin ended our last connection: it still counts it; retry \(n) of "
                     + "\(Self.faultedRetryDelaysSeconds.count) in \(delayText)s before the ladder (givo-11)",
+                    category: .demux)
+            } else if selfCaused.delay == 0 {
+                emitNetworkPhase(.reconnecting)   // givo-21: the source is down while the host mints
+                EngineLog.emit(
+                    "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(selfCaused.since * 1000))ms after our "
+                    + "last connection ended and the quick retry was refused too: asking the host for a fresh "
+                    + "address, nothing charged (givo-21)",
                     category: .demux)
             } else {
                 EngineLog.emit(

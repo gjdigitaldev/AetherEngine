@@ -845,6 +845,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// still applies under it. nil (the default) keeps the engine's budget.
     public var segmentCacheMaxBytes: Int64? = nil
 
+    /// givo-8: seconds this load waits, after the previous session's teardown has closed its source
+    /// request and before the first request of its own, for an origin that keeps counting a closed
+    /// connection for a moment (a connection-capped IPTV panel). Useful when a load replaces a running
+    /// session in place (a PiP window kept across the next episode), where the host has no teardown of
+    /// its own to wait behind. Capped at 10 s; nil (the default) dials at once.
+    public var sourceDialDelaySeconds: Double? = nil
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on

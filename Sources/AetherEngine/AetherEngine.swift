@@ -4242,6 +4242,14 @@ public final class AetherEngine: ObservableObject {
         // Audit CORE-6: the first suspension point. Two loads issued back to back right after init
         // both wait on the same category task, and the older one must not resume as the current one.
         try checkLoadCurrent(gen)
+        // givo-8: the previous session's source request closed in the teardown above; an origin that
+        // keeps counting a closed connection for a moment gets that moment before this load dials.
+        if let delay = options.sourceDialDelaySeconds, delay > 0, delay.isFinite {
+            EngineLog.emit("[AetherEngine] load (gen \(gen)): previous source closed, waiting "
+                           + "\(String(format: "%.1f", delay))s before the first request (givo-8)", category: .engine)
+            try await Task.sleep(nanoseconds: UInt64(min(delay, 10) * 1_000_000_000))
+            try checkLoadCurrent(gen)
+        }
 
         // nativeRemoteHLS: skip probe + loopback; play HLS URL directly with AVPlayer (Jellyfin already serves HLS).
         // Routed before the probe because we never demux the m3u8.

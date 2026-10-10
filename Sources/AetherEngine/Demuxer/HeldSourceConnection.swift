@@ -298,7 +298,13 @@ final class HeldSourceConnection: @unchecked Sendable {
         case .identity(let remaining):
             if remaining <= 0 { return nil }
             let want = Int(min(Int64(limit), remaining))
-            guard let data = try readBody(upTo: want) else { return nil }
+            guard let data = try readBody(upTo: want) else {
+                // givo-11: the origin closed the socket mid-body. It ends like a clean end (the
+                // reader replaces it at the frontier), so this line is the only witness of who ended it.
+                EngineLog.emit("[HeldSourceConnection] gen=\(generation) the origin closed the connection with "
+                               + "\(remaining / 1024)KB of the body still due", category: .demux)
+                return nil
+            }
             framing = .identity(remaining: remaining - Int64(data.count))
             return data
         case .chunked(let decoder):

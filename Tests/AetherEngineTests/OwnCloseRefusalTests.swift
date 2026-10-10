@@ -136,3 +136,65 @@ struct HeldConnectionPaceTests {
         #expect(elapsed > 2.0, "8 MB at a 2 MB/s pace took \(elapsed)s")
     }
 }
+
+/// givo-11: a connection-capped panel that ENDED a connection itself (a mid-body close) keeps
+/// counting it until its own socket timeout notices, measured past 11 s (a 1-connection panel's
+/// front closed a held connection 161 MB in, and refused the replacement 509 at 0.3 s, 1.3 s and
+/// 11 s). Those refusals are our own connection too: retries at 1, 2, 4 and 8 s, nothing charged.
+@Suite("Faulted-connection refusal (givo-11)", .offCooperativePool)
+struct FaultedConnectionRefusalTests {
+
+    private final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func next() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            value += 1
+            return value
+        }
+    }
+
+    @Test("refusals after the origin ended our connection retry at 1, 2 and 4 s and charge nothing",
+          .timeLimit(.minutes(2)), arguments: [false, true])
+    func refusalsAfterAFaultRetryWithoutTheLadder(held: Bool) async throws {
+        let dropAt: Int64 = 8 * 1024 * 1024
+        let refusals = Counter()
+        let serverMaybe = ThrottledOriginServer(
+            totalSize: 96 * 1024 * 1024, chunkBytes: 64 * 1024, throttleUs: 0,
+            respond: { _, offset, _ in
+                if offset == 0 { return .serveThenDrop(afterBytes: dropAt) }
+                // The frontier only (wherever the drop left it: a close with unread bytes can lose
+                // some in flight); the open's tail prefetch asks near the end and must not spend them.
+                if offset > 0, offset < dropAt * 2, refusals.next() <= 3 { return .status(509) }
+                return .serve206
+            })
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+
+        let url = URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
+        let reader = AVIOReader(url: url, heldConnection: held)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let slice = 256 * 1024
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: slice)
+        defer { buf.deallocate() }
+        let began = Date()
+        var got: Int64 = 0
+        while got < dropAt + 4 * Int64(slice) {
+            let n = reader.read(into: buf, size: Int32(slice))
+            if n <= 0 { break }
+            got += Int64(n)
+        }
+        let elapsed = Date().timeIntervalSince(began)
+
+        #expect(got >= dropAt + 4 * Int64(slice), "reading must continue past the dropped connection")
+        #expect(server.requestLog.filter { $0.start > 0 && $0.start < dropAt * 2 }.count >= 4,
+                "three refusals, then served: \(server.requestLog)")
+        #expect(reader.rateLimitStreakForTesting == 0, "the refusals are our faulted connection, not metering")
+        #expect(OriginRequestBudget.shared.limit(for: url) == nil, "no concurrency budget may be learned from them")
+        #expect(!OriginRequestBudget.shared.isPaced(url), "and no request-rate pacer armed")
+        // Upper bound only: other suites scale the reconnect backoff process-wide while this runs.
+        #expect(elapsed < 12, "1 + 2 + 4 s of retries, not the ladder (took \(elapsed)s)")
+    }
+}

@@ -1137,10 +1137,13 @@ public final class AetherEngine: ObservableObject {
     func consumeInPlaceItemHandoverRequest(priorBackendWasNative: Bool) -> Bool {
         let hostRequested = nextLoadRequestsInPlaceItemHandover
         nextLoadRequestsInPlaceItemHandover = false
+        // givo-18: the item `closeSource()` kept is native even though the backend now reads `.none`.
+        let keptByClose = closedSourceKeptNativeItem && nativeHost != nil
+        closedSourceKeptNativeItem = false
         return Self.shouldHandOverItemInPlace(
             pipActive: pictureInPictureActive,
-            hostRequested: hostRequested,
-            priorBackendWasNative: priorBackendWasNative
+            hostRequested: hostRequested || keptByClose,
+            priorBackendWasNative: priorBackendWasNative || keptByClose
         )
     }
 
@@ -6417,11 +6420,19 @@ public final class AetherEngine: ObservableObject {
         cancelPendingAudioSelection()
         nextLoadRequestsInPlaceItemHandover = false
         stopInternal(resetDisplayCriteria: false, keepNativeHost: native, keepCurrentItem: native)
+        closedSourceKeptNativeItem = native   // givo-18
         state = .paused
     }
 
+    /// givo-18: `closeSource()` left a native item attached on its last frame. The teardown reset the
+    /// backend to `.none`, so the next `load()` would read "nothing native here" and detach it; this
+    /// makes that load hand the item over in place instead, as a PiP or host-requested handover does.
+    /// Consumed by the next load, cleared by `stop()`.
+    var closedSourceKeptNativeItem = false
+
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         registerCarriedIdentityHeaders([], source: nil)   // givo-16
+        closedSourceKeptNativeItem = false   // givo-18
         cancelPendingAudioSelection()
         releaseHeldPicture(reason: "stop")
         nextLoadRequestsInPlaceItemHandover = false

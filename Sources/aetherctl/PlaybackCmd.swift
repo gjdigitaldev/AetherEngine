@@ -739,6 +739,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
         case let call where call.hasPrefix("seekfar") || call.hasPrefix("seeknear") || call.hasPrefix("avseek") || call.hasPrefix("seekto@")
             || call.hasPrefix("handover@") || call.hasPrefix("pauseat@") || call.hasPrefix("playat@")
+            || call.hasPrefix("reloaditem@")
             || call.hasPrefix("subsoff")
             || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
@@ -944,6 +945,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     }
     let pauseAtTicks = Set(hostCalls.filter { $0.hasPrefix("pauseat@") }.compactMap { Int($0.split(separator: "@").last ?? "") })
     let playAtTicks = Set(hostCalls.filter { $0.hasPrefix("playat@") }.compactMap { Int($0.split(separator: "@").last ?? "") })
+    let reloadItemTick: Int? = hostCalls.first(where: { $0.hasPrefix("reloaditem@") })
+        .flatMap { Int($0.split(separator: "@").last ?? "") }
     let handoverTick: Int? = hostCalls.first(where: { $0.hasPrefix("handover@") })
         .flatMap { Int($0.split(separator: "@").last ?? "") }
     let seekNearSpec: (tick: Int, ahead: Double)? = hostCalls.first(where: { $0.hasPrefix("seeknear") }).map { call in
@@ -1288,6 +1291,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             print(String(format: "  HOSTCALL play() at t=%d (playhead %.2f, state=%@)", tick, engine.currentTime,
                          String(describing: engine.state)))
             engine.play()
+        }
+        // givo-30 lab: `reloaditem@N` puts a fresh item on the open's loopback session, source kept.
+        if let reloadItemTick, tick == reloadItemTick {
+            print("  HOSTCALL reloadItemKeepingSource() -> \(engine.reloadItemKeepingSource())")
         }
         if let handoverTick, tick == handoverTick {
             print(String(format: "  HOSTCALL prepareForItemReplacement + reloadAtCurrentPosition at %.2f", engine.currentTime))

@@ -806,16 +806,33 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     /// givo-24: how far ahead of the frontier a read may jump and still wait on the live connection.
-    nonisolated static func forwardKeepLimit(bytesPerSecond: Double?, isLive: Bool) -> Int64 {
-        guard !isLive, let rate = bytesPerSecond, rate.isFinite, rate > 0 else { return Int64(seekKeepForwardLimit) }
+    /// givo-30: never shorter during the open or on a one-request origin, where a connection is the
+    /// scarce thing: an Xtream front that admits about five per minute refused the open's fifth after a
+    /// 4 MB skip in the head parse had cost one (the rate read in the head's first second was ~2 MB/s).
+    nonisolated static func forwardKeepLimit(bytesPerSecond: Double?, isLive: Bool,
+                                             openPhase: Bool = false, serialOrigin: Bool = false) -> Int64 {
+        guard !isLive, !openPhase, !serialOrigin, let rate = bytesPerSecond, rate.isFinite, rate > 0 else {
+            return Int64(seekKeepForwardLimit)
+        }
         return min(Int64(seekKeepForwardLimit), max(forwardKeepMinimumBytes, Int64(rate * forwardKeepSeconds)))
     }
 
-    /// Caller holds `winCond`.
-    private func forwardKeepLimitLocked() -> Int64 {
+    /// Caller holds `winCond`. `serialOrigin` is read before the lock is taken (it takes the budget's).
+    private func forwardKeepLimitLocked(serialOrigin: Bool) -> Int64 {
         let rate = Self.deliveryRate(bytes: connDeliveredBytes, since: connFirstDataAt, now: DispatchTime.now())
             ?? lastConnectionBytesPerSecond
-        return Self.forwardKeepLimit(bytesPerSecond: rate, isLive: isLive)
+        return Self.forwardKeepLimit(bytesPerSecond: rate, isLive: isLive, openPhase: openPhaseActive,
+                                     serialOrigin: serialOrigin)
+    }
+
+    /// givo-30: a seek's new connection starts this far before its target, so a container that steps
+    /// back a few bytes at the jump (the matroska producer re-read 4 bytes before where the open had
+    /// left the body connection, which cost the open its fifth connection) reads inside the window.
+    static let seekReconnectCushionBytes: Int64 = 64 * 1024
+
+    /// givo-30: where a seek's connection starts for `target`.
+    nonisolated static func seekReconnectStart(target: Int64, isLive: Bool) -> Int64 {
+        isLive ? target : max(0, target - seekReconnectCushionBytes)
     }
     // CDN stall threshold: no bytes for this long triggers reconnect. Instance-captured (see
     // `connStallTimeout`) so tests can shorten it; the shipped value is this one.
@@ -2364,6 +2381,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func readPersistent(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         let requestSize = Int(size)
         var totalRead = 0
+        let serialOrigin = originRequiresSerialRequests   // givo-30
         sweepIdleDetourBlocks()
 
         // #93 restart latency: accumulate where THIS read spends its time; one summary line fires
@@ -2710,7 +2728,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let selfCausedRetryAt = self.selfCausedRetryAt   // givo-1
             let sourceRefreshExhaustedFails = sourceRefreshExhausted   // givo-20
 
-            if curPosition > frontier + forwardKeepLimitLocked() {
+            if curPosition > frontier + forwardKeepLimitLocked(serialOrigin: serialOrigin) {
                 winCond.unlock()
                 // Far-forward seek. Serve from the detour cache ONLY if the block is already
                 // resident (e.g. the moov region the parser revisits); a genuine forward scrub
@@ -2874,7 +2892,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         nextFaultedRefillAt = .distantPast
         selfCausedRetrySpent = false   // givo-1: a reposition is a new lineage with its own retry
         winCond.unlock()
-        startPersistentConnection(at: offset)
+        startPersistentConnection(at: Self.seekReconnectStart(target: offset, isLive: isLive))   // givo-30
     }
 
     /// Increments the unproductive-reconnect streak (resets if progress exceeded

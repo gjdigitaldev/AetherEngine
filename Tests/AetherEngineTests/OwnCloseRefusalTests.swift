@@ -24,12 +24,14 @@ struct OwnCloseRefusalTests {
           .timeLimit(.minutes(2)), arguments: [509, 458, 460], [false, true])
     func refusalAfterOwnCloseRetriesOnce(status: Int, held: Bool) async throws {
         let target: Int64 = 48 * 1024 * 1024
+        // givo-30: the seek's connection starts its cushion before the target.
+        let dial = AVIOReader.seekReconnectStart(target: target, isLive: false)
         let hitsAtTarget = Counter()
         // Slow enough that the first connection is still delivering when the seek ends it.
         let serverMaybe = ThrottledOriginServer(
             totalSize: 96 * 1024 * 1024, chunkBytes: 64 * 1024, throttleUs: 20_000,
             respond: { _, offset, _ in
-                guard offset == target else { return .serve206 }
+                guard offset == dial else { return .serve206 }
                 return hitsAtTarget.next() == 1 ? .status(status) : .serve206
             })
         let server = try #require(serverMaybe)
@@ -52,7 +54,7 @@ struct OwnCloseRefusalTests {
         let elapsed = Date().timeIntervalSince(began)
 
         #expect(n > 0, "the retry must deliver")
-        #expect(server.requestLog.filter { $0.start == target }.count == 2,
+        #expect(server.requestLog.filter { $0.start == dial }.count == 2,
                 "one refusal, one retry: \(server.requestLog)")
         #expect(reader.rateLimitStreakForTesting == 0, "the refusal is ours, not the origin metering")
         #expect(OriginRequestBudget.shared.limit(for: url) == nil, "no concurrency budget may be learned from it")

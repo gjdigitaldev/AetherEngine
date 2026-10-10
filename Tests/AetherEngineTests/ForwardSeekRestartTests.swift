@@ -73,4 +73,17 @@ struct ForwardSeekRestartTests {
         #expect(AVIOReader.deliveryRate(bytes: 2_600_000, since: start,
                                          now: DispatchTime(uptimeNanoseconds: 1_200_000_000)) == nil)
     }
+
+    @Test("givo-30: no rate-aware keep shrink during the open or on a one-request origin")
+    func forwardKeepHoldsOnScarceConnections() {
+        #expect(AVIOReader.forwardKeepLimit(bytesPerSecond: 1_300_000, isLive: false, openPhase: true) == 8 * 1024 * 1024)
+        #expect(AVIOReader.forwardKeepLimit(bytesPerSecond: 1_300_000, isLive: false, serialOrigin: true) == 8 * 1024 * 1024)
+    }
+
+    @Test("givo-30: a seek's connection starts 64 KB before its target, never before byte 0, and not on live")
+    func seekReconnectCushion() {
+        #expect(AVIOReader.seekReconnectStart(target: 4_197_354, isLive: false) == 4_197_354 - 65_536)
+        #expect(AVIOReader.seekReconnectStart(target: 1000, isLive: false) == 0)
+        #expect(AVIOReader.seekReconnectStart(target: 4_197_354, isLive: true) == 4_197_354)
+    }
 }

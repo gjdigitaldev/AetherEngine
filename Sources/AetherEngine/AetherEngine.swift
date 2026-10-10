@@ -189,8 +189,17 @@ public final class AetherEngine: ObservableObject {
     /// Reader source-fetch axis feeding `playbackPhase`. Updated off the demux thread via
     /// `setReaderNetworkPhase`. `didSet` keeps `playbackPhase` in sync (#85).
     private var readerStall: ReaderNetworkPhase = .flowing {
-        didSet { recomputePlaybackPhase() }
+        didSet {
+            recomputePlaybackPhase()
+            let reconnecting = readerStall == .reconnecting
+            if sourceIsReconnecting != reconnecting { sourceIsReconnecting = reconnecting }
+        }
     }
+
+    /// givo-30: the source is reconnecting (a refused or dropped connection the reader is retrying),
+    /// including during an open, where `playbackPhase` reads `.loading` whatever the source does. A host
+    /// that tells a provider's slot refusal from a dead source needs the open's axis too.
+    @Published public private(set) var sourceIsReconnecting = false
 
     /// Idempotent: assigns `playbackPhase` only when the derived value actually changes, so a flapping
     /// origin or redundant input write never fires a spurious `objectWillChange`.
@@ -1728,6 +1737,20 @@ public final class AetherEngine: ObservableObject {
     /// Not for app use; the real trigger is the recovery ladder.
     public func forceStalledConsumerReloadForTesting() {
         reloadStalledConsumerItem(position: currentTime, allowPausedConsumer: true)
+    }
+
+    /// givo-30: put a fresh item on the loopback session the open built, keeping the source and the
+    /// producer. For an open whose source was refused and recovered while AVPlayer was already
+    /// waiting on the init segment: AVPlayer gave up on the map ("No response for map", -12889)
+    /// before the bytes came, and the item then waits for nothing. Returns false when there is no
+    /// loopback item to replace, or the picture is already up.
+    @discardableResult
+    public func reloadItemKeepingSource() -> Bool {
+        guard nativeHost != nil, nativeVideoSession != nil, !isLive, !hasFirstFrameReadyForDisplay,
+              currentAVPlayer?.currentItem != nil else { return false }
+        EngineLog.emit("[AetherEngine] reloading the open's item over the same source (givo-30)", category: .engine)
+        reloadStalledConsumerItem(position: currentTime, allowPausedConsumer: true)
+        return true
     }
 
     /// TEST-ONLY: throttle source IO to simulate a slow CDN/origin (kbit/s; 0 = unlimited). Read once by

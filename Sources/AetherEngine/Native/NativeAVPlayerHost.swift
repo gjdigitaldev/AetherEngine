@@ -1835,6 +1835,9 @@ final class NativeAVPlayerHost {
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
+        // givo-26: a seek's first leg is holding its keyframe; the hold's end plays from the target.
+        // Rolling now would play the seconds before the target first.
+        if seekBridgeHoldsKeyframe { return }
         // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }

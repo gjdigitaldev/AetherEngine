@@ -722,7 +722,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
         case let call where call.hasPrefix("seekfar") || call.hasPrefix("seeknear") || call.hasPrefix("avseek") || call.hasPrefix("seekto@")
-            || call.hasPrefix("handover@") || call.hasPrefix("subsoff")
+            || call.hasPrefix("handover@") || call.hasPrefix("pauseat@") || call.hasPrefix("playat@")
+            || call.hasPrefix("subsoff")
             || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
@@ -925,6 +926,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         guard spec.count == 2, let tick = Int(spec[0]), let target = Double(spec[1]) else { return nil }
         return (tick, target)
     }
+    let pauseAtTicks = Set(hostCalls.filter { $0.hasPrefix("pauseat@") }.compactMap { Int($0.split(separator: "@").last ?? "") })
+    let playAtTicks = Set(hostCalls.filter { $0.hasPrefix("playat@") }.compactMap { Int($0.split(separator: "@").last ?? "") })
     let handoverTick: Int? = hostCalls.first(where: { $0.hasPrefix("handover@") })
         .flatMap { Int($0.split(separator: "@").last ?? "") }
     let seekNearSpec: (tick: Int, ahead: Double)? = hostCalls.first(where: { $0.hasPrefix("seeknear") }).map { call in
@@ -1257,6 +1260,16 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                     last = now
                 }
             }
+        }
+        // givo-26/27 lab: the app's own pause()/play() at chosen ticks (`pauseat@N`, `playat@N`).
+        if pauseAtTicks.contains(tick) {
+            print(String(format: "  HOSTCALL pause() at t=%d (playhead %.2f)", tick, engine.currentTime))
+            engine.pause()
+        }
+        if playAtTicks.contains(tick) {
+            print(String(format: "  HOSTCALL play() at t=%d (playhead %.2f, state=%@)", tick, engine.currentTime,
+                         String(describing: engine.state)))
+            engine.play()
         }
         if let handoverTick, tick == handoverTick {
             print(String(format: "  HOSTCALL prepareForItemReplacement + reloadAtCurrentPosition at %.2f", engine.currentTime))

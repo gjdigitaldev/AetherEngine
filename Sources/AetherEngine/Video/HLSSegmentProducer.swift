@@ -820,8 +820,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// opened, and flush fragments every `progressiveFragmentSeconds` so the loopback server has
     /// something to send while the segment is still being cut.
     private let servesSegmentsProgressively: Bool
-    /// givo-22: only this producer's first segment (`baseIndex`, a seek's landing) is progressive.
+    /// givo-22: only this producer's first segments (from `baseIndex`, a seek's landing) are progressive.
     private let progressiveFirstSegment: Bool
+    /// givo-27: how many segments from a seek's landing are served as they are cut. The landing alone
+    /// left a target late in its segment waiting for the next one's whole cut before AVPlayer would
+    /// play (lab, 1.3 MB/s: picture after 21.2 s for a target 7.5 s into a 10 s segment); steady play
+    /// past these keeps whole cuts (D107).
+    static let progressiveSegmentsAfterSeek = 2
     /// givo-24: the session's march pace, fed at every read start and cut (VOD only).
     private let marchPace: MarchPaceMeter?
     /// The fragment cadence inside a progressively delivered segment. Measured with `aetherctl play`
@@ -2642,10 +2647,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Progressive delivery is VOD only: live keeps its own window and blocking-reload contracts.
-    /// givo-22: per segment, so a seek's landing segment can be progressive on its own.
+    /// givo-22: per segment, so a seek's landing segments can be progressive on their own.
     private func servesProgressively(_ index: Int) -> Bool {
         guard !isLive else { return false }
-        return servesSegmentsProgressively || (progressiveFirstSegment && index == baseIndex)
+        return servesSegmentsProgressively
+            || (progressiveFirstSegment && Self.isLandingSegment(index, landing: baseIndex))
+    }
+
+    /// givo-27: the landing segment and the one after it.
+    nonisolated static func isLandingSegment(_ index: Int, landing: Int) -> Bool {
+        index >= landing && index < landing + progressiveSegmentsAfterSeek
     }
 
     private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {

@@ -1691,12 +1691,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         landingLock.lock(); _progressiveLandingIndex = index; landingLock.unlock()
     }
 
-    /// givo-22: whether `index` is fetched progressively.
+    /// givo-22: whether `index` is fetched progressively (givo-27: the landing and the one after it).
     private func fetchesProgressively(_ index: Int) -> Bool {
         if fetchesProgressively { return true }
         guard !isLive else { return false }
         landingLock.lock(); defer { landingLock.unlock() }
-        return _progressiveLandingIndex == index
+        guard let landing = _progressiveLandingIndex else { return false }
+        return HLSSegmentProducer.isLandingSegment(index, landing: landing)
     }
 
     private func serveSource(at index: Int) -> SegmentSource? {

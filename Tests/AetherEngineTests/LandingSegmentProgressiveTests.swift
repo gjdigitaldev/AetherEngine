@@ -15,4 +15,12 @@ struct LandingSegmentProgressiveTests {
         #expect(SessionOptionCorrection.knownFields.contains("progressiveSegmentDeliveryAfterSeek"))
         #expect(SessionOptionCorrection.refusedFields(from: LoadOptions(), to: options).isEmpty)
     }
+
+    @Test("givo-27: the landing and the segment after it are progressive; the march past them is whole again")
+    func landingAndNextAreProgressive() {
+        #expect(HLSSegmentProducer.isLandingSegment(15, landing: 15))
+        #expect(HLSSegmentProducer.isLandingSegment(16, landing: 15))
+        #expect(!HLSSegmentProducer.isLandingSegment(17, landing: 15))
+        #expect(!HLSSegmentProducer.isLandingSegment(14, landing: 15))
+    }
 }

@@ -796,6 +796,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// givo-3: `LoadOptions.firstSegmentTargetSeconds`, read by the VOD planner. Set before `start()`.
     var firstSegmentTargetSeconds: Double?
+    /// givo-7: `LoadOptions.segmentCacheMaxBytes`, a ceiling on the retention budget. Set before `start()`.
+    var segmentCacheMaxBytes: Int64?
 
     /// Serializes restart requests among themselves. Held across waits (unlike `restartLock`);
     /// only other restarts contend on it.
@@ -1569,8 +1571,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         #endif
         let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
         // #687: sized from what the other running sessions leave, not from the raw free space.
+        let cacheCeiling = segmentCacheMaxBytes.map { Int(clamping: max(0, $0)) }   // givo-7
         let claim = RetentionClaims.shared.claim(volumeAvailableBytes: availableBytes) {
-            Self.sessionRetentionBudgetBytes(volumeAvailableBytes: $0, capRelaxed: capRelaxed)
+            let budget = Self.sessionRetentionBudgetBytes(volumeAvailableBytes: $0, capRelaxed: capRelaxed)
+            return cacheCeiling.map { min(budget, $0) } ?? budget   // givo-7
         }
         let retentionBudget = claim.bytes
         self.retentionBudgetBytes = retentionBudget
@@ -1588,6 +1592,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"), "
             + "forwardWindow=\(forwardWindowSegments) seg"
             + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "")
+            + (cacheCeiling.map { ", host ceiling \($0 / (1 << 20)) MiB (givo-7)" } ?? "")
             + (claim.heldBackBytes > 0
                 ? ", \(claim.heldBackBytes / (1 << 20)) MiB held back for other sessions" : "") + ")",
             category: .session

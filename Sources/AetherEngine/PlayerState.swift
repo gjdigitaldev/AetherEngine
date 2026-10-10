@@ -838,6 +838,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// `maxConcurrentSourceRequests`, so a later load of the same origin sets or clears it.
     public var heldSourceMaxBitsPerSecond: Int64? = nil
 
+    /// givo-7: a ceiling, in bytes, on the native VOD session's segment-cache budget. The budget is
+    /// otherwise 2 GiB, or a quarter of the free space once `forwardBufferSegments` opts into a
+    /// whole-source prefetch (past 150); this caps either, so a host can buffer a film ahead without
+    /// letting one session claim a quarter of a small device's disk. The quarter-of-free-space clamp
+    /// still applies under it. nil (the default) keeps the engine's budget.
+    public var segmentCacheMaxBytes: Int64? = nil
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on

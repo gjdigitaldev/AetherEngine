@@ -871,6 +871,7 @@ extension AetherEngine {
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
         session.firstSegmentTargetSeconds = loadedOptions.firstSegmentTargetSeconds   // givo-3
+        session.segmentCacheMaxBytes = loadedOptions.segmentCacheMaxBytes   // givo-7
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate

@@ -4126,6 +4126,8 @@ public final class AetherEngine: ObservableObject {
         // later reopen of the same source are bound by it too.
         if !isCustomSource {
             OriginRequestBudget.shared.setHostLimit(options.maxConcurrentSourceRequests, for: url)
+            // givo-6: nil clears a pace an earlier load of this origin set.
+            OriginRequestBudget.shared.setHeldPace(bitsPerSecond: options.heldSourceMaxBitsPerSecond, for: url)
         } else if let ingest = customReader as? HLSLiveIngestReader {
             // AE#678: the ingest fetches from the playlist's origin, not from `aether-custom://`.
             OriginRequestBudget.shared.setHostLimit(

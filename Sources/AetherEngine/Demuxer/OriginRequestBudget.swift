@@ -119,6 +119,8 @@ final class OriginRequestBudget: @unchecked Sendable {
         /// connection for about a second after it closes, so a refusal that lands inside that window
         /// is our own previous connection, not the origin metering a new one.
         var lastOwnCloseAt: DispatchTime?
+        /// givo-6: `LoadOptions.heldSourceMaxBitsPerSecond`, in bytes per second; nil = unpaced.
+        var heldPaceBytesPerSecond: Double?
         var refusals = 0
         var lastRefusalAt: DispatchTime?
         /// nil `quietUntil` means the request-rate pacer is inert. The bucket remains untouched
@@ -230,6 +232,9 @@ final class OriginRequestBudget: @unchecked Sendable {
                     merged.quietUntil = theirQuiet
                     merged.refusalStreak = joining.refusalStreak
                 }
+            }
+            if merged.heldPaceBytesPerSecond == nil {   // givo-6
+                merged.heldPaceBytesPerSecond = joining.heldPaceBytesPerSecond
             }
             if let theirs = joining.lastOwnCloseAt {   // givo-1
                 merged.lastOwnCloseAt = merged.lastOwnCloseAt.map { max($0, theirs) } ?? theirs
@@ -668,6 +673,23 @@ final class OriginRequestBudget: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let closed = origins[headLocked(raw)]?.lastOwnCloseAt else { return nil }
         return Self.elapsedSeconds(from: closed, to: now())
+    }
+
+    /// givo-6: the read rate a held connection to this origin may pull at, set per load. Kept on the
+    /// books like the host limit, so the reopens and restarts of the session are paced too.
+    func setHeldPace(bitsPerSecond: Int64?, for url: URL) {
+        guard let raw = Self.originKey(for: url) else { return }
+        lock.lock(); defer { lock.unlock() }
+        let key = headLocked(raw)
+        var state = origins[key] ?? OriginState()
+        state.heldPaceBytesPerSecond = bitsPerSecond.flatMap { $0 > 0 ? Double($0) / 8 : nil }
+        origins[key] = state
+    }
+
+    func heldPaceBytesPerSecond(for url: URL) -> Double? {
+        guard let raw = Self.originKey(for: url) else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return origins[headLocked(raw)]?.heldPaceBytesPerSecond
     }
 
     /// True when this origin refused a request within `window`. The engine's revive arm asks this

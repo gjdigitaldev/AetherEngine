@@ -829,6 +829,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// `nativeRemoteHLS` and on the software path.
     public var firstSegmentTargetSeconds: Double? = nil
 
+    /// givo-6: the most a `heldSourceConnection` may pull from the source, in bits per second, for an
+    /// origin that meters bandwidth as well as connections (an Apache front answering 509 "Bandwidth
+    /// Limit Exceeded" to the next request after a burst). The held connection is demand driven, so
+    /// the cap holds the read itself: the producer's race ahead (a large `forwardBufferSegments`)
+    /// fills at this rate instead of at the link's. nil (the default) pulls as fast as the window
+    /// allows. Applies to the held connection only; keyed on the origin like
+    /// `maxConcurrentSourceRequests`, so a later load of the same origin sets or clears it.
+    public var heldSourceMaxBitsPerSecond: Int64? = nil
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on

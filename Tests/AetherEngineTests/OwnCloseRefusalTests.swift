@@ -101,3 +101,38 @@ struct OwnCloseRefusalTests {
         #expect(!OriginRequestBudget.shared.isPaced(url))
     }
 }
+
+/// givo-6: `LoadOptions.heldSourceMaxBitsPerSecond` holds a held connection's pull to its pace, so a
+/// whole-film race ahead does not burst an origin that meters bandwidth.
+@Suite("Held connection pace (givo-6)", .offCooperativePool)
+struct HeldConnectionPaceTests {
+
+    @Test("a paced held connection pulls no faster than its pace", .timeLimit(.minutes(2)))
+    func pacedHeldConnectionHoldsItsRate() async throws {
+        let serverMaybe = ThrottledOriginServer(totalSize: 64 * 1024 * 1024, throttleUs: 0)
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+        let url = URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
+        OriginRequestBudget.shared.setHeldPace(bitsPerSecond: 16_000_000, for: url)   // 2 MB/s
+        defer { OriginRequestBudget.shared.setHeldPace(bitsPerSecond: nil, for: url) }
+
+        let reader = AVIOReader(url: url, heldConnection: true)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let slice = 256 * 1024
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: slice)
+        defer { buf.deallocate() }
+        let began = Date()
+        var got = 0
+        while got < 8 * 1024 * 1024 {
+            let n = reader.read(into: buf, size: Int32(slice))
+            if n <= 0 { break }
+            got += Int(n)
+        }
+        let elapsed = Date().timeIntervalSince(began)
+        #expect(got >= 8 * 1024 * 1024)
+        // 8 MB at 2 MB/s, less the first second of bucket and the open's head: well over 2 s.
+        #expect(elapsed > 2.0, "8 MB at a 2 MB/s pace took \(elapsed)s")
+    }
+}

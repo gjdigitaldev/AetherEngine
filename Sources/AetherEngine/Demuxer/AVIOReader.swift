@@ -992,6 +992,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// so an origin that refuses the retry too goes to the ladder rather than retrying forever.
     /// winCond-guarded.
     private var selfCausedRetrySpent = false
+    /// givo-6: token bucket for a paced held connection (bytes), refilled at the origin's pace,
+    /// holding at most one second of it. winCond-guarded.
+    private var heldPaceTokens: Double = 0
+    private var heldPaceRefilledAt: DispatchTime?
 
     /// Detour LRU block cache (its own leaf lock, never held across `fetchChunk`/network or
     /// `winCond`). Stores only full-size blocks; short bodies are served once but never cached
@@ -4932,6 +4936,8 @@ extension AVIOReader: HeldSourceConnectionDelegate {
     /// generation that is abandoned (a seek, a close, a reconnect) wakes this immediately and
     /// answers 0 rather than waiting out its budget.
     func heldConnectionPullBudget(_ connection: HeldSourceConnection) -> Int {
+        // givo-6: read before winCond; the budget's lock is a leaf and is never taken under it.
+        let pace = OriginRequestBudget.shared.heldPaceBytesPerSecond(for: connection.respondedBy)
         var budget = 0
         var pausedEndAhead: Int? = nil
         // Only a paused consumer carries a deadline, and only from the moment it paused.
@@ -4943,6 +4949,23 @@ extension AVIOReader: HeldSourceConnectionDelegate {
             let room = winHighWater - ahead
             if room >= Self.heldPullSlack {
                 budget = min(room, Self.heldMaxPullBytes)
+                if let pace {   // givo-6: pull no faster than the pace, in slack-sized grants or more
+                    let now = DispatchTime.now()
+                    if let last = heldPaceRefilledAt {
+                        let elapsed = Double(now.uptimeNanoseconds &- last.uptimeNanoseconds) / 1_000_000_000
+                        heldPaceTokens = min(max(pace, Double(Self.heldPullSlack)), heldPaceTokens + elapsed * pace)
+                    } else {
+                        heldPaceTokens = Double(Self.heldPullSlack)
+                    }
+                    heldPaceRefilledAt = now
+                    if heldPaceTokens < Double(Self.heldPullSlack) {
+                        let wait = (Double(Self.heldPullSlack) - heldPaceTokens) / pace
+                        _ = winCond.wait(until: Date(timeIntervalSinceNow: wait))
+                        continue
+                    }
+                    budget = min(budget, Int(heldPaceTokens))
+                    heldPaceTokens -= Double(budget)
+                }
                 // A read begins here, and the gap watchdog judges an OUTSTANDING one. Without this
                 // the wait that preceded the grant counts against the read it granted: coming back
                 // from a park longer than connStallTimeout, the first tick after this would see a

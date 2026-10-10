@@ -898,6 +898,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// a mirror, because the close that reads it runs on a playlist-build thread.
     var consumerBufferedSecondsProvider: (@Sendable () -> Double?)?
 
+    /// givo-24: the session's march pace (VOD). Set by `HLSVideoEngine` before the first fetch.
+    var marchPace: MarchPaceMeter?
+
     /// AE#523: the source's own delivery rhythm, which is what the outage decision is judged against.
     private var _liveDeliveryCadence = SourceDeliveryCadenceMeter()
     /// AE#446 round 2: once ENDLIST has been served it can never be withdrawn to the item that saw it,
@@ -1747,6 +1750,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // for this same index). Bypasses the restart loop's producerCovers veto below, which
         // otherwise reads the dead producer's still-installed base and suppresses the fire.
         var marchProvenDead = false
+        // givo-24: set when the forward-wait branch measured the march reaching this index later
+        // than a restart at it would serve it. Bypasses the same veto as `marchProvenDead`.
+        var marchOutpaced = false
         // AE#169 round 2: true when the fetch takes the VOD forward-window backpressure wait, so a
         // full-timeout miss records (index, front) for the frozen-march escalation above.
         var tookForwardWait = false
@@ -1802,9 +1808,20 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                             + "); escalating to restart",
                             category: .session
                         )
+                    } else if index <= front + Self.forwardWaitWindow,
+                              let pace = marchPace?.reading(),
+                              let lead = Self.marchLeadBeforeRestartWins(index: index, pace: pace) {
+                        marchOutpaced = true
+                        EngineLog.emit(
+                            "[HLSVideoEngine] seg\(index): forward seek the march would only start in "
+                            + String(format: "%.1f", lead) + " s (seg\(pace.inProgressIndex) in progress, "
+                            + String(format: "%.1f", pace.secondsPerSegment) + " s per segment); restarting "
+                            + "there (givo-24)",
+                            category: .session
+                        )
                     }
                 }
-                needsRestart = index > front + Self.forwardWaitWindow || marchProvenDead
+                needsRestart = index > front + Self.forwardWaitWindow || marchProvenDead || marchOutpaced
             }
         } else {
             // Empty cache: cold start (producer at lastRestartIndex, hasn't written yet) vs. big scrub
@@ -1841,7 +1858,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     // AE#169 round 2: a march proven dead (finished pump / frozen front across a
                     // full wait) must not veto the fire; the still-installed dead producer's base
                     // covering the index is exactly the wedge being escaped.
-                    let producerCovers = !marchProvenDead && activeProducerCovers(index)
+                    let producerCovers = !marchProvenDead && !marchOutpaced && activeProducerCovers(index)
                     // A request superseded by a NEWER declared target is an orphan of a skip
                     // storm: AVPlayer's newest request is what it actually wants (the same
                     // newest-wins semantics the coalescer applies to immediate restarts).
@@ -1904,6 +1921,28 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                                      lastMissIndex: Int, lastMissFront: Int) -> Bool {
         if producerFinished { return true }
         return lastMissIndex == index && lastMissFront == marchFront
+    }
+
+    /// givo-24: the allowance for a restart's dial and demuxer seek before its first byte.
+    static let restartDialAllowanceSeconds: Double = 1.0
+    /// givo-24: how much sooner a restart must start the target before it is worth the dial.
+    static let forwardRestartMarginSeconds: Double = 1.0
+
+    /// givo-24 pure decision: how long the active march would take to START cutting `index`, when
+    /// that is longer than a restart's dial plus the margin; nil keeps the wait. Both ways then cut
+    /// `index` itself at the same pace, and AVPlayer asks for the segment after it only once it has
+    /// this one whole, so the head start is the whole difference. (A seek's first ask is not its
+    /// target's segment: AVPlayer starts about 15 s before the target, which is why serving the first
+    /// ask from its first fragment does not bring the picture forward.) Only a jump past the segment
+    /// in progress qualifies: a sequential fetch is the march itself.
+    static func marchLeadBeforeRestartWins(index: Int, pace: MarchPaceMeter.Reading) -> Double? {
+        guard index > pace.inProgressIndex, pace.secondsPerSegment.isFinite, pace.secondsPerSegment > 0 else {
+            return nil
+        }
+        let perSegment = pace.secondsPerSegment
+        let lead = max(0, perSegment - pace.inProgressElapsedSeconds)
+            + Double(index - pace.inProgressIndex - 1) * perSegment
+        return lead > restartDialAllowanceSeconds + forwardRestartMarginSeconds ? lead : nil
     }
 
     private func recordForwardWaitMiss(index: Int, front: Int) {

@@ -789,6 +789,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private static let winTrimBatch = 4 * 1024 * 1024
     // Forward seeks within this distance keep the live connection; beyond it, reconnect.
     private static let seekKeepForwardLimit = 8 * 1024 * 1024
+    /// givo-24: on a measured VOD link, keep the live connection for a forward jump only as far as it
+    /// delivers in this long; past it a fresh request at the jump's offset is sooner. Lab, 1.3 MB/s: a
+    /// producer restart 7.2 MB ahead waited 5.5 s on the old connection for bytes nobody wanted.
+    static let forwardKeepSeconds: Double = 2.0
+    /// givo-24: a forward skip this short always rides the live connection.
+    static let forwardKeepMinimumBytes: Int64 = 512 * 1024
+
+    /// givo-24: the rate of `bytes` delivered since `since`, once there is enough of both to mean it.
+    nonisolated static func deliveryRate(bytes: Int64, since: DispatchTime?, now: DispatchTime) -> Double? {
+        guard let since, now.uptimeNanoseconds > since.uptimeNanoseconds, bytes >= 1024 * 1024 else { return nil }
+        let seconds = Double(now.uptimeNanoseconds - since.uptimeNanoseconds) / 1_000_000_000
+        return seconds >= 0.5 ? Double(bytes) / seconds : nil
+    }
+
+    /// givo-24: how far ahead of the frontier a read may jump and still wait on the live connection.
+    nonisolated static func forwardKeepLimit(bytesPerSecond: Double?, isLive: Bool) -> Int64 {
+        guard !isLive, let rate = bytesPerSecond, rate.isFinite, rate > 0 else { return Int64(seekKeepForwardLimit) }
+        return min(Int64(seekKeepForwardLimit), max(forwardKeepMinimumBytes, Int64(rate * forwardKeepSeconds)))
+    }
+
+    /// Caller holds `winCond`.
+    private func forwardKeepLimitLocked() -> Int64 {
+        let rate = Self.deliveryRate(bytes: connDeliveredBytes, since: connFirstDataAt, now: DispatchTime.now())
+            ?? lastConnectionBytesPerSecond
+        return Self.forwardKeepLimit(bytesPerSecond: rate, isLive: isLive)
+    }
     // CDN stall threshold: no bytes for this long triggers reconnect. Instance-captured (see
     // `connStallTimeout`) so tests can shorten it; the shipped value is this one.
     private static let connStallTimeoutDefault: TimeInterval = 20
@@ -1071,6 +1097,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var staleGenDroppedBytes: Int64 = 0
     private var connStartedAt = DispatchTime.now()
     private var connFirstDataSeen = false
+    /// givo-24: what the current connection has delivered since its first byte, and the last finished
+    /// connection's rate, for the rate-aware forward keep (`forwardKeepLimitLocked`). winCond-guarded.
+    private var connDeliveredBytes: Int64 = 0
+    private var connFirstDataAt: DispatchTime?
+    private var lastConnectionBytesPerSecond: Double?
     /// The generation `awaitFirstPersistentData` is waiting on, while it waits. Its first byte is
     /// governed by the open policy's budget, not by the delivery-gap watchdog.
     private var openAwaitedGeneration: Int?
@@ -2607,7 +2638,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let selfCausedRetryAt = self.selfCausedRetryAt   // givo-1
             let sourceRefreshExhaustedFails = sourceRefreshExhausted   // givo-20
 
-            if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
+            if curPosition > frontier + forwardKeepLimitLocked() {
                 winCond.unlock()
                 // Far-forward seek. Serve from the detour cache ONLY if the block is already
                 // resident (e.g. the moov region the parser revisits); a genuine forward scrub
@@ -3422,6 +3453,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connRetryAfter = 0
         connSelfCausedRefusal = false   // givo-1
         connStartedAt = DispatchTime.now()   // #93: time-to-first-data per generation
+        if let rate = Self.deliveryRate(bytes: connDeliveredBytes, since: connFirstDataAt, now: connStartedAt) {
+            lastConnectionBytesPerSecond = rate   // givo-24
+        }
+        connDeliveredBytes = 0
+        connFirstDataAt = nil
         connFirstDataSeen = false
         lastDeliveryAt = connStartedAt       // #309: the gap is measured from here until data lands
         // `nextFaultedRefillAt` is deliberately NOT reset here. The faulted-refill ladder sets it
@@ -3722,6 +3758,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var firstDataMs: Double? = nil
         if !connFirstDataSeen {
             connFirstDataSeen = true
+            connFirstDataAt = DispatchTime.now()   // givo-24
             firstDataMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
             // #281 retest: the price of one round trip against this origin, which is what bounds
             // how long a read may wait for bytes that are already on the wire.
@@ -3760,6 +3797,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             headSpan.append(data.prefix(Self.headSpanMaxBytes - headSpan.count))
         }
         addBytesFetched(count)
+        connDeliveredBytes += Int64(count)   // givo-24
         // #220: the requested range has been delivered in full. That ends the connection on
         // purpose; the read loop re-requests at the frontier once the consumer has drawn down.
         var overDeliveredTransfer: (any PersistentTransfer)?

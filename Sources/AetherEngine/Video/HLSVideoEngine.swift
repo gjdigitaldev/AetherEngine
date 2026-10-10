@@ -796,6 +796,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// givo-22: `LoadOptions.progressiveSegmentDeliveryAfterSeek`: a seek restart's first segment is
     /// served as it is cut.
     var servesLandingSegmentProgressively = false
+    /// givo-24: the march pace every VOD producer of this session feeds, read by the provider when a
+    /// forward seek has to choose between waiting for the march and restarting at its target.
+    let marchPaceMeter = MarchPaceMeter()
 
     /// givo-3: `LoadOptions.firstSegmentTargetSeconds`, read by the VOD planner. Set before `start()`.
     var firstSegmentTargetSeconds: Double?
@@ -2094,6 +2097,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // AE#520 round 2: the close reads it on the playlist-build thread, so it is a closure over a
         // mirror rather than a read of the item.
         prov.consumerBufferedSecondsProvider = consumerBufferedSecondsProvider
+        if !isLiveSession { prov.marchPace = marchPaceMeter }   // givo-24
         wireProviderCallbacks(prod, to: prov)
 
         EngineLog.emit(
@@ -2905,6 +2909,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioDelaySeconds: audioDelaySeconds,
             servesSegmentsProgressively: servesSegmentsProgressively,
             progressiveFirstSegment: landingSegmentProgressive,   // givo-22
+            marchPace: isLiveSession ? nil : marchPaceMeter,   // givo-24
             epoch: producerEpoch
         )
         // #240: threaded onto every producer (initial + restart), like the wedge-detector providers

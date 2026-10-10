@@ -822,6 +822,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private let servesSegmentsProgressively: Bool
     /// givo-22: only this producer's first segment (`baseIndex`, a seek's landing) is progressive.
     private let progressiveFirstSegment: Bool
+    /// givo-24: the session's march pace, fed at every read start and cut (VOD only).
+    private let marchPace: MarchPaceMeter?
     /// The fragment cadence inside a progressively delivered segment. Measured with `aetherctl play`
     /// on a Mac over a 6 Mbit/s origin (1080p HEVC at 2.7 Mbit/s, 3-9 s GOPs): playing after 1.9 s at
     /// 1 s fragments and 1.7 s at 0.5 s, against 2.3 s without progressive delivery. Each fragment
@@ -1498,11 +1500,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioDelaySeconds: Double = 0,
         servesSegmentsProgressively: Bool = false,
         progressiveFirstSegment: Bool = false,
+        marchPace: MarchPaceMeter? = nil,
         epoch: UInt64 = 0
     ) throws {
         self.epoch = epoch
         self.servesSegmentsProgressively = servesSegmentsProgressively
         self.progressiveFirstSegment = progressiveFirstSegment   // givo-22
+        self.marchPace = isLive ? nil : marchPace   // givo-24
         self.audioDelaySeconds = audioDelaySeconds
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.audioMoovPrimeKnownUnobtainable = audioMoovPrimeKnownUnobtainable
@@ -2197,6 +2201,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.installMuxer(muxer)
             self.currentMuxerSegmentIndex = initialSegmentIndex
             self.noteSegmentInProgress(initialSegmentIndex, muxer: muxer)
+            self.marchPace?.readStarted(initialSegmentIndex, counts: false)   // givo-24
             return muxer
         } catch {
             EngineLog.emit(
@@ -2409,6 +2414,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         stagingPath: path,
                         byteCount: bytesWritten,
                         videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
+            marchPace?.segmentCut(currentMuxerSegmentIndex)   // givo-24
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
@@ -2491,6 +2497,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         currentMuxerSegmentIndex = newIdx
         noteSegmentInProgress(newIdx, muxer: muxer)
+        marchPace?.segmentQueued(newIdx)   // givo-24
         if isLive {
             // Live is source-paced: the pump only runs ahead of real time while draining the join
             // backlog, and the sliding window (notePlaylistBuild -> evictBelow) bounds resident
@@ -2528,6 +2535,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                                detectWedge: parkSkipped) { return nil }
         }
         if checkShouldStop() { return nil }
+        marchPace?.readStarted(newIdx, counts: true)   // givo-24
 
         return muxer
     }

@@ -6401,6 +6401,25 @@ public final class AetherEngine: ObservableObject {
         nextLoadRequestsInPlaceItemHandover = true
     }
 
+    /// givo-17: end the session's source requests now, so the origin sees the close, and keep the
+    /// picture: a native item holds its last frame, paused, until the next `load()` replaces it.
+    /// For a host that must close a refused or stalled dial, wait an origin's cooldown and dial again
+    /// (a set-top-box portal's Retry, a remount of a growing recording) without a black frame in
+    /// between. Nothing else of the session survives: transport and seeks do nothing until the next
+    /// `load()`, and `stop()` still ends everything. A no-op on an idle engine.
+    public func closeSource() {
+        guard state != .idle else { return }
+        let native = playbackBackend == .native && nativeHost != nil
+        EngineLog.emit("[AetherEngine] givo-17: closing the source requests"
+                       + (native ? "; the item keeps its last frame until the next load" : ""), category: .engine)
+        nativeHost?.pause()
+        softwareHost?.pause()
+        cancelPendingAudioSelection()
+        nextLoadRequestsInPlaceItemHandover = false
+        stopInternal(resetDisplayCriteria: false, keepNativeHost: native, keepCurrentItem: native)
+        state = .paused
+    }
+
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         registerCarriedIdentityHeaders([], source: nil)   // givo-16
         cancelPendingAudioSelection()

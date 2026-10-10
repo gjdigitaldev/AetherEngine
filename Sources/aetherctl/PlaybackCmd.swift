@@ -712,7 +712,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             // exists (the foreground retune's hold-paused policy). Resumed at tick 8.
             print("  HOSTCALL pause() right after load")
             engine.pause()
-        case "reloadlive", "reloadnext", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
+        case "closesource",   // givo-17
+             "reloadlive", "reloadnext", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
             break  // reloadlive handled at load time, seekback/overlapseek/pauseseek in the telemetry loop
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
@@ -1099,6 +1100,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             } else {
                 print(String(format: "  HOSTCALL still(at: %.2f, %@) -> MISS in %d ms", target, label, ms))
             }
+        }
+        // givo-17: close the source at t=5 (the origin should see the close at once, the item keep its
+        // last frame), then load the same URL again at t=9, the shape of a portal Retry.
+        if hostCalls.contains("closesource"), tick == 5 {
+            print("  HOSTCALL closeSource()")
+            engine.closeSource()
+            print("  after closeSource: state=\(engine.state) item=\(engine.currentAVPlayer?.currentItem != nil ? "kept" : "none")")
+        }
+        if hostCalls.contains("closesource"), tick == 9 {
+            print("  HOSTCALL load(same url) after closeSource")
+            _ = try? await engine.load(url: url, options: options)
         }
         if hostCalls.contains("seekback"), tick == 15 {
             let target = max(0, engine.currentTime - 20)

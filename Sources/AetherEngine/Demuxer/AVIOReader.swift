@@ -3736,6 +3736,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         respondedBy: URL?,
         generation: Int
     ) -> Bool {
+        EngineHTTP.noteSourceResponse(requested: respondedBy ?? requestURL(), http)   // givo-13
         let status = http.statusCode
         var isOK = status == 200 || status == 206
         var retryAfter: TimeInterval = 0
@@ -5436,6 +5437,9 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
         // Hang up at the header so the error page never enters the stream buffer, where FFmpeg
         // would probe it as container bytes and report "Invalid data found when processing
         // input" for what was a refusal (#378).
+        if let http = response as? HTTPURLResponse {   // givo-13
+            EngineHTTP.noteSourceResponse(requested: dataTask.currentRequest?.url ?? dataTask.originalRequest?.url, http)
+        }
         if let http = response as? HTTPURLResponse, http.statusCode != 200, http.statusCode != 206 {
             onRefused?(http.statusCode, dataTask.currentRequest?.url ?? http.url)
             completionHandler(.cancel)

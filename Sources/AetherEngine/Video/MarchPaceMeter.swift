@@ -30,6 +30,12 @@ final class MarchPaceMeter: @unchecked Sendable {
 
     private let lock = NSLock()
     private var samples: [Double] = []
+    /// givo-28: wall seconds per media second of the same cuts, where the plan knew the cut's length.
+    private var mediaRates: [Double] = []
+    /// givo-28: the same figure from a producer's first segment, which also carries the dial and the
+    /// seek, so it reads the link as slower than it is; used only until a marched cut is measured (a
+    /// seek right after the open has nothing else).
+    private var provisionalMediaRate: Double?
     private var inProgressIndex = Int.min
     private var readStartedAt: UInt64?
     private var currentCounts = false
@@ -50,13 +56,35 @@ final class MarchPaceMeter: @unchecked Sendable {
         currentCounts = counts
     }
 
-    /// The pump cut `index`.
-    func segmentCut(_ index: Int, now: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+    /// The pump cut `index`, `mediaSeconds` of plan long when the plan knows it.
+    func segmentCut(_ index: Int, mediaSeconds: Double? = nil, now: UInt64 = DispatchTime.now().uptimeNanoseconds) {
         lock.lock(); defer { lock.unlock() }
-        guard index == inProgressIndex, currentCounts, let started = readStartedAt, now > started else { return }
-        samples.append(Double(now - started) / 1_000_000_000)
+        guard index == inProgressIndex, let started = readStartedAt, now > started else { return }
+        let wall = Double(now - started) / 1_000_000_000
+        guard currentCounts else {
+            if let mediaSeconds, mediaSeconds.isFinite, mediaSeconds >= 0.5 { provisionalMediaRate = wall / mediaSeconds }
+            return
+        }
+        samples.append(wall)
         if samples.count > Self.sampleCapacity { samples.removeFirst(samples.count - Self.sampleCapacity) }
+        if let mediaSeconds, mediaSeconds.isFinite, mediaSeconds >= 0.5 {
+            mediaRates.append(wall / mediaSeconds)
+            if mediaRates.count > Self.sampleCapacity { mediaRates.removeFirst(mediaRates.count - Self.sampleCapacity) }
+        }
         currentCounts = false
+    }
+
+    /// givo-28: the march's wall seconds per media second (median of the recent cuts), nil before one.
+    func wallSecondsPerMediaSecond() -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        return Self.median(mediaRates) ?? provisionalMediaRate
+    }
+
+    private static func median(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
     }
 
     func reading(now: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Reading? {

@@ -4215,11 +4215,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// 15 s, whether the target sat mid-segment or exactly on a segment start; a margin past that.
     nonisolated static let exactSeekLookbackSeconds: Double = 16
 
-    /// givo-26: the start of the plan segment that holds `itemSeconds`, when part of an exact seek's
-    /// look-back would have to come from the producer; nil when all of it is resident in the segment
-    /// cache (an exact seek then costs nothing it would not anyway), on live, or with no plan. Checks
-    /// the cache's files, so it runs off the main actor.
-    func tolerantSeekLegStart(itemSeconds: Double) -> Double? {
+    /// givo-26/28: what a loopback VOD seek's legs are decided on.
+    struct SeekLandingFacts: Equatable {
+        /// The start of the plan segment that holds the target: its keyframe.
+        let segmentStart: Double
+        /// That segment is in the segment cache, so the stretch to the target loads at once.
+        let targetSegmentResident: Bool
+        /// The session march's wall seconds per media second, nil before it has cut a segment.
+        let wallSecondsPerMediaSecond: Double?
+    }
+
+    /// givo-26/28: the facts for a seek to `itemSeconds`, nil when an exact seek's whole look-back is
+    /// resident in the segment cache (it then costs nothing it would not anyway), on live, or with no
+    /// plan. Checks the cache's files, so it runs off the main actor.
+    func seekLandingFacts(itemSeconds: Double) -> SeekLandingFacts? {
         guard !isLiveSession, let cache, itemSeconds.isFinite else { return nil }
         let targetIndex = segmentIndexForPlaylistTime(itemSeconds)
         let firstIndex = segmentIndexForPlaylistTime(max(0, itemSeconds - Self.exactSeekLookbackSeconds))
@@ -4227,8 +4236,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let start: Double? = targetIndex < segmentPlan.count ? segmentPlan[targetIndex].startSeconds : nil
         restartLock.unlock()
         guard let start, firstIndex <= targetIndex else { return nil }
-        let resident = (firstIndex...targetIndex).allSatisfy { cache.peekURL(index: $0) != nil }
-        return resident ? nil : start
+        let resident = (firstIndex...targetIndex).map { cache.peekURL(index: $0) != nil }
+        guard resident.contains(false) else { return nil }
+        return SeekLandingFacts(segmentStart: start, targetSegmentResident: resident.last == true,
+                                wallSecondsPerMediaSecond: marchPaceMeter.wallSecondsPerMediaSecond())
     }
 
     /// AE#141: whether the active producer's march can plausibly deliver the segment covering

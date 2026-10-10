@@ -2419,7 +2419,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         stagingPath: path,
                         byteCount: bytesWritten,
                         videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
-            marchPace?.segmentCut(currentMuxerSegmentIndex)   // givo-24
+            marchPace?.segmentCut(currentMuxerSegmentIndex,   // givo-24
+                                  mediaSeconds: planSeconds(from: currentMuxerSegmentIndex, to: newIdx))   // givo-28
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
@@ -2652,6 +2653,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
         guard !isLive else { return false }
         return servesSegmentsProgressively
             || (progressiveFirstSegment && Self.isLandingSegment(index, landing: baseIndex))
+    }
+
+    /// givo-28: the plan's media seconds from segment `index` to `nextIndex` (a cut that folded indices
+    /// covers them too). VOD only; nil outside this producer's plan.
+    private func planSeconds(from index: Int, to nextIndex: Int) -> Double? {
+        let i = index - baseIndex, j = nextIndex - baseIndex
+        guard !isLive, sourceVideoTbSeconds > 0, i >= 0, j > i, j < segmentBoundaries.count else { return nil }
+        return Double(segmentBoundaries[j] - segmentBoundaries[i]) * sourceVideoTbSeconds
     }
 
     /// givo-27: the landing segment and the one after it.

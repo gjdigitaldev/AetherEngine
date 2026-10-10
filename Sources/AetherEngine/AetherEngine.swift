@@ -349,29 +349,69 @@ public final class AetherEngine: ObservableObject {
         setDeferredSeek(inFlight: false, target: nil)
     }
 
-    /// AE#412: run `preparedSeekLanding` off the main actor. It parks on the pump while a re-cut
-    /// opens its gate, and a seek must not hold the main actor for that (AE#422).
-    /// givo-26: the first leg's tolerance for a loopback VOD seek, 0 for today's exact seek. Exact when
-    /// the item already holds the whole look-back or the segment cache does; otherwise the first leg
-    /// may land as far back as the keyframe that starts the target's segment, so AVPlayer asks for that
-    /// segment first instead of the ones about 15 s before it.
-    func tolerantSeekToleranceBefore(itemSeconds: Double) async -> Double {
-        guard !isLive, nativeHost != nil, let session = nativeVideoSession, itemSeconds.isFinite else { return 0 }
+    /// givo-26/28: how a loopback VOD seek goes out.
+    enum SeekLegPlan: Equatable {
+        /// Today's single exact seek: the look-back is cached, or this is not a loopback VOD seek.
+        case exact
+        /// A first leg that may land as far back as the keyframe starting the target's segment (so
+        /// AVPlayer asks for that segment first, not the ones about 15 s before it), held there until
+        /// the target is loaded, then an exact leg.
+        case twoLeg(toleranceBefore: Double)
+        /// givo-28: the first leg only. The seek lands on `segmentStart`'s keyframe and plays at once.
+        case keyframe(segmentStart: Double, toleranceBefore: Double)
+
+        var toleranceBefore: Double {
+            switch self {
+            case .exact: return 0
+            case .twoLeg(let tolerance), .keyframe(_, let tolerance): return tolerance
+            }
+        }
+    }
+
+    /// givo-28: the longest a seek may hold its keyframe for the stretch to the target before landing
+    /// on the keyframe wins (owner D121, with `seekLandsOnKeyframeWhenSlow`).
+    nonisolated static let keyframeLandingMaxHoldSeconds: Double = 1.5
+
+    func seekLegPlan(itemSeconds: Double) async -> SeekLegPlan {
+        guard !isLive, nativeHost != nil, softwareHost == nil, audioHost == nil, !audioAVPlayerActive,
+              let session = nativeVideoSession, itemSeconds.isFinite else { return .exact }
         let lookbackStart = max(0, itemSeconds - HLSVideoEngine.exactSeekLookbackSeconds)
         if await avPlayerLoadedRanges().contains(where: { $0.0 <= lookbackStart && $0.1 >= itemSeconds }) {
-            return 0
+            return .exact
         }
-        let segmentStart = await BlockingWork.detached(priority: .userInitiated) {
-            session.tolerantSeekLegStart(itemSeconds: itemSeconds)
+        let facts = await BlockingWork.detached(priority: .userInitiated) {
+            session.seekLandingFacts(itemSeconds: itemSeconds)
         }.value
-        guard let segmentStart else { return 0 }
-        let tolerance = Self.tolerantSeekTolerance(itemSeconds: itemSeconds, segmentStart: segmentStart)
+        guard let facts else { return .exact }
+        let tolerance = Self.tolerantSeekTolerance(itemSeconds: itemSeconds, segmentStart: facts.segmentStart)
+        let gap = itemSeconds - facts.segmentStart
+        let at = String(format: "%.2f", itemSeconds), keyframe = String(format: "%.2f", facts.segmentStart)
+        if loadedOptions.seekLandsOnKeyframeWhenSlow,
+           let hold = Self.keyframeLandingHold(gapSeconds: gap, wallSecondsPerMediaSecond: facts.wallSecondsPerMediaSecond,
+                                               targetSegmentResident: facts.targetSegmentResident) {
+            EngineLog.emit(
+                "[AetherEngine] seek to \(at)s: the link would take about \(String(format: "%.1f", hold))s to load the "
+                + "\(String(format: "%.2f", gap))s from the keyframe; landing on the keyframe at \(keyframe)s and "
+                + "playing from there (givo-28)",
+                category: .engine)
+            return .keyframe(segmentStart: facts.segmentStart, toleranceBefore: tolerance)
+        }
         EngineLog.emit(
-            "[AetherEngine] seek to \(String(format: "%.2f", itemSeconds))s: the look-back before it is not cached, "
-            + "first leg to the keyframe at \(String(format: "%.2f", segmentStart))s "
-            + "(toleranceBefore \(String(format: "%.2f", tolerance))s), then exact (givo-26)",
+            "[AetherEngine] seek to \(at)s: the look-back before it is not cached, first leg to the keyframe at "
+            + "\(keyframe)s (toleranceBefore \(String(format: "%.2f", tolerance))s), then exact (givo-26)",
             category: .engine)
-        return tolerance
+        return .twoLeg(toleranceBefore: tolerance)
+    }
+
+    /// givo-28 pure decision: the hold the stretch from the keyframe to the target would cost, when it
+    /// is longer than `keyframeLandingMaxHoldSeconds`; nil keeps the exact two-leg seek. A resident
+    /// target segment loads at once, and an unmeasured link is not judged slow.
+    nonisolated static func keyframeLandingHold(gapSeconds: Double, wallSecondsPerMediaSecond: Double?,
+                                                targetSegmentResident: Bool) -> Double? {
+        guard !targetSegmentResident, let rate = wallSecondsPerMediaSecond, rate.isFinite, rate > 0,
+              gapSeconds.isFinite, gapSeconds > 0 else { return nil }
+        let hold = gapSeconds * rate
+        return hold > keyframeLandingMaxHoldSeconds ? hold : nil
     }
 
     /// givo-26: an exact seek onto a segment's very start still looked back in the lab, so the first
@@ -380,6 +420,8 @@ public final class AetherEngine: ObservableObject {
         max(0.5, itemSeconds - segmentStart)
     }
 
+    /// AE#412: run `preparedSeekLanding` off the main actor. It parks on the pump while a re-cut
+    /// opens its gate, and a seek must not hold the main actor for that (AE#422).
     private static func prepareSeekLanding(
         session: HLSVideoEngine?, itemSeconds: Double
     ) async -> Double {
@@ -5916,6 +5958,19 @@ public final class AetherEngine: ObservableObject {
         // i.e. clockTarget == the 0-based playlist time (AE#105). Origin 0 off disc, so this stays
         // `target - playlistShiftSeconds` for normal VOD; SW/audio hosts run on source time (shift 0), no-op.
         var clockTarget = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin) - playlistShiftSeconds
+        // givo-26/28: how the seek goes out. A keyframe landing moves the target onto the keyframe here,
+        // before anything below reads it, so the clock, the landing checks and the recovery all aim at
+        // the frame the seek will show; the host still seeks toward the requested time, with the
+        // tolerance that lets it stop on that keyframe.
+        let legPlan = await seekLegPlan(itemSeconds: clockTarget)
+        guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
+        let requestedItemTarget = clockTarget
+        if case .keyframe(let segmentStart, _) = legPlan {
+            clockTarget = segmentStart
+            target = PresentationAxis.display(sourcePTS: segmentStart + playlistShiftSeconds,
+                                              origin: sourcePresentationOrigin)
+            setProgrammaticSeek(inFlight: true, target: target)
+        }
         // AE#418 round 2: AVPlayer throws a sub-second axis offset away at a seek and snaps back to
         // the playlist; a larger one it carries through unchanged (measured with `play
         // --picture-probe`: -0.500 and -0.875 read `axisErr=0.000` after a seek, -1.000 through
@@ -6015,11 +6070,16 @@ public final class AetherEngine: ObservableObject {
             // re-issued seek for a bounded number of windows rather than reverting to the old position.
             var reanchored = false
             var postReanchorWaits = 0
-            let toleranceBefore = await tolerantSeekToleranceBefore(itemSeconds: clockTarget)   // givo-26
-            guard loadGeneration == gen, seekGeneration == seekGen else { return }
-            var landed = await nativeHost?.seek(to: clockTarget,
+            // givo-26/28: the leg plan decided above; a keyframe landing seeks toward the requested
+            // time and stops on the keyframe its tolerance reaches.
+            let toleranceBefore = legPlan.toleranceBefore
+            let landsOnKeyframe: Bool
+            if case .keyframe = legPlan { landsOnKeyframe = true } else { landsOnKeyframe = false }
+            let hostSeekTarget = landsOnKeyframe ? requestedItemTarget : clockTarget
+            var landed = await nativeHost?.seek(to: hostSeekTarget,
                                                 deadlineSeconds: Self.nativeSeekReconcileBudgetSeconds,
-                                                toleranceBefore: toleranceBefore) ?? true
+                                                toleranceBefore: toleranceBefore,
+                                                landsOnKeyframe: landsOnKeyframe) ?? true
             deadlineLoop: while !landed {
                 // Deadline expired. Only the surviving (winning) generation reconciles; a superseded seek
                 // returns at the guard below and lets the newer seek own the final state.
@@ -6259,9 +6319,10 @@ public final class AetherEngine: ObservableObject {
                     // Re-issue the seek toward the (re-anchored) target. A deadline does not cancel the
                     // prior seek, but this fresh zero-tolerance seek supersedes it and points AVPlayer at
                     // the re-anchored region so it stops waiting on the abandoned old-position segments.
-                    landed = await host.seek(to: clockTarget,
+                    landed = await host.seek(to: hostSeekTarget,
                                              deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds,
-                                             toleranceBefore: toleranceBefore)   // givo-26: no look-back on the re-issue
+                                             toleranceBefore: toleranceBefore,
+                                             landsOnKeyframe: landsOnKeyframe)   // givo-26/28: no look-back on the re-issue
                     continue deadlineLoop
                 }
                 // Already re-anchored + re-seeked. Keep holding the clock at the target and wait on the

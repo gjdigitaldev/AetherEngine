@@ -591,6 +591,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     if ProcessInfo.processInfo.environment["AETHERCTL_PROGRESSIVE_AFTER_SEEK"] == "1" {
         options.progressiveSegmentDeliveryAfterSeek = true
     }
+    // givo-28: `AETHERCTL_KEYFRAME_WHEN_SLOW=1` lands a seek on its keyframe on a slow link.
+    if ProcessInfo.processInfo.environment["AETHERCTL_KEYFRAME_WHEN_SLOW"] == "1" {
+        options.seekLandsOnKeyframeWhenSlow = true
+    }
     if let carry = ProcessInfo.processInfo.environment["AETHERCTL_CARRY_HEADERS"] {
         options.carryIdentityHeadersAcrossRedirects = carry.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
     }
@@ -1252,7 +1256,9 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                     try? await Task.sleep(nanoseconds: 50_000_000)
                     guard let player = engine.currentAVPlayer else { continue }
                     let now = player.currentTime().seconds
-                    if player.timeControlStatus == .playing, now > last + 0.02, abs(now - spec.target) < 3 {
+                    // givo-28: a keyframe landing starts up to one keyframe interval before the target.
+                    if player.timeControlStatus == .playing, now > last + 0.02, now >= spec.target - 12,
+                       now <= spec.target + 3 {
                         print(String(format: "  SEEKTO %.2f picture moving after %.2f s at %.2f (from %.2f)", spec.target,
                                      Date().timeIntervalSince(issued), now, before))
                         break

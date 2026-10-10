@@ -828,6 +828,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// play keep `progressiveSegmentDelivery`. Default false. VOD only, ignored where that is.
     public var progressiveSegmentDeliveryAfterSeek: Bool = false
 
+    /// givo-28: on a link too slow to load the stretch from a seek's landing keyframe to its target
+    /// within 1.5 s (measured on the session's own march), the seek lands on that keyframe and plays
+    /// at once, and the clock publishes the keyframe: up to one keyframe interval before the target.
+    /// Fast links, short stretches and resident segments keep the exact seek. Default false. VOD on
+    /// the loopback only.
+    public var seekLandsOnKeyframeWhenSlow: Bool = false
+
     /// givo-3: cut the first VOD loopback segment at the first keyframe at or after this many seconds
     /// instead of at the full cut target, so AVPlayer can start on a segment one GOP long. Only a
     /// keyframe-aligned plan is split, only where a keyframe falls inside the default first segment,

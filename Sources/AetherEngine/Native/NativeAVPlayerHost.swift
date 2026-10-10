@@ -1989,7 +1989,11 @@ final class NativeAVPlayerHost {
     /// served from what AVPlayer holds (an exact leg issued before that re-runs the look-back). Only
     /// the second leg's completion is this seek's completion.
     @discardableResult
-    func seek(to seconds: Double, deadlineSeconds: Double?, toleranceBefore: Double = 0) async -> Bool {
+    ///
+    /// givo-28: `landsOnKeyframe` makes it the first leg only: the seek completes on the keyframe the
+    /// tolerance reaches and plays from there (a slow link, owner D121).
+    func seek(to seconds: Double, deadlineSeconds: Double?, toleranceBefore: Double = 0,
+              landsOnKeyframe: Bool = false) async -> Bool {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
         seekGeneration &+= 1
         let gen = seekGeneration
@@ -2012,9 +2016,10 @@ final class NativeAVPlayerHost {
             }
             // Zero tolerances: unbounded tolerances caused AVPlayer to land on arbitrary sync samples for loopback HLS-fMP4 (openradar 44904505).
             // givo-26's first leg is bounded to the target's own segment, so the sync sample it can land on is that segment's start.
-            let exactLeg: @MainActor () -> Void = { [weak self] in
+            let finalLeg: @MainActor (Double) -> Void = { [weak self] before in
             guard let self else { if resumeGuard.claim() { cont.resume(returning: false) }; return }
-            self.avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player = self.avPlayer] finished in
+            let legBefore = before > 0 ? CMTime(seconds: before, preferredTimescale: 600) : .zero
+            self.avPlayer.seek(to: target, toleranceBefore: legBefore, toleranceAfter: .zero) { [weak self, weak player = self.avPlayer] finished in
                 // Sample at completion, before a busy main actor can let playback advance far
                 // enough to make a successful seek appear to have missed the target.
                 let actual = player?.currentTime().seconds ?? .nan
@@ -2023,8 +2028,10 @@ final class NativeAVPlayerHost {
                         if resumeGuard.claim() { cont.resume(returning: false) }
                         return
                     }
-                    let landed = gen == self.seekGeneration && Self.seekCompletionReachedTarget(
-                        finished: finished, actual: actual, target: seconds)
+                    let landed = gen == self.seekGeneration && (before > 0
+                        ? Self.tolerantLegLanded(finished: finished, actual: actual, target: seconds,
+                                                 toleranceBefore: before)
+                        : Self.seekCompletionReachedTarget(finished: finished, actual: actual, target: seconds))
                     // Settle the clock on a real landing even if the deadline already returned (late landing).
                     // Superseded seek: leave the newer generation's flags intact.
                     if gen == self.seekGeneration {
@@ -2051,6 +2058,14 @@ final class NativeAVPlayerHost {
                     if resumeGuard.claim() { cont.resume(returning: landed) }
                 }
             }
+            }
+            let exactLeg: @MainActor () -> Void = { finalLeg(0) }
+            if landsOnKeyframe, toleranceBefore > 0 {
+                EngineLog.emit("[NativeAVPlayerHost] givo-28 landing on the keyframe within "
+                               + "\(String(format: "%.2f", toleranceBefore))s before \(String(format: "%.2f", seconds))s "
+                               + "and playing from there", category: .engine)
+                finalLeg(toleranceBefore)
+                return
             }
             guard toleranceBefore > 0, let item = playerItem else {
                 exactLeg()

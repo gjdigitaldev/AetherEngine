@@ -223,6 +223,7 @@ final class HeldSourceConnection: @unchecked Sendable {
                 hops += 1
                 closeSocket()
                 OriginRequestBudget.shared.noteRedirect(from: source, to: next)
+                EngineTLS.redirectObserver?(source, next)   // givo-12: the hop this path follows itself
                 target = next
                 continue
             }

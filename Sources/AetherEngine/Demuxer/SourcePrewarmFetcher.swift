@@ -211,6 +211,8 @@ enum RangeFetch {
 }
 
 private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    /// givo-9: the URL that answered with a body, so its close can be stamped.
+    private var servedBy: URL?
     enum Outcome {
         case body(RangeFetch.Result)
         case rejected(String)
@@ -330,6 +332,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         // `http.url` is the URL that answered, redirects followed, which is the one a later load
         // should start at instead of resolving the chain again (#551 round 2).
         respondedURL = http.url
+        servedBy = http.url ?? dataTask.originalRequest?.url   // givo-9
         completionHandler(.allow)
     }
 
@@ -343,6 +346,9 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // givo-9: a warm the origin was serving has ended (finished or cancelled mid-body); the playing
+        // session's reader measures its next refusal against this close like against its own (givo-1).
+        if let servedBy { OriginRequestBudget.shared.noteOwnClose(for: servedBy) }
         deliver(outcome(error: error))
     }
 

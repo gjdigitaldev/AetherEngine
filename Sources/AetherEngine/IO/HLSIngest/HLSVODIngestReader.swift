@@ -118,6 +118,116 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         }
     }
 
+    /// R2542 (givo-25): what the engine does with a finite playlist it was about to hand AVPlayer.
+    enum RerouteVerdict {
+        /// AE#268: positive HEVC-in-MPEG-TS evidence; the ingest reads it.
+        case hevcInMPEGTS(HLSVODIngestReader)
+        /// Every segment names one file, with no map and no key: the playlist wraps one progressive
+        /// file, which the loopback opens directly instead of AVPlayer's HLS parser.
+        case singleFile(URL)
+        /// AVPlayer plays it. `ingestCanRetry`: a TS media playlist the ingest can read, so a refusal
+        /// before any media arrived gets one retry there.
+        case native(ingestCanRetry: Bool)
+    }
+
+    /// R2542 (givo-25): the AE#268 decision, widened. The playlists are fetched once; their shape is
+    /// logged whatever the verdict (no host, no query: where each URI points is said as relative,
+    /// same host or other host), so the next AVPlayer refusal of a playlist says what it refused.
+    static func rerouteVerdict(
+        playlistURL: URL,
+        httpHeaders: [String: String],
+        session: URLSession? = nil
+    ) async throws -> RerouteVerdict {
+        let reader = HLSVODIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, session: session)
+        var accepted = false
+        defer {
+            if !accepted { reader.close() }
+        }
+        do {
+            let root = try await reader.fetchPlaylistFacts(playlistURL)
+            var shape = ["root " + PlaylistShape.describe(root.playlist, at: root.url, requested: playlistURL,
+                                                        bytes: root.bytes, byteRanges: root.byteRanges)]
+            var media: (playlist: HLSMediaPlaylist, url: URL)?
+            var variantHasDemuxedAudio = false
+            switch root.playlist {
+            case .media(let value):
+                media = (value, root.url)
+            case .master(let master):
+                if let best = master.variants.max(by: { $0.bandwidth < $1.bandwidth }),
+                   let url = HLSPlaylistParser.resolve(uri: best.uri, against: root.url) {
+                    variantHasDemuxedAudio = best.audioGroupID != nil
+                    let variant = try await reader.fetchPlaylistFacts(url)
+                    shape.append("best variant " + PlaylistShape.describe(
+                        variant.playlist, at: variant.url, requested: url, bytes: variant.bytes,
+                        byteRanges: variant.byteRanges))
+                    if case .media(let value) = variant.playlist { media = (value, variant.url) }
+                }
+            }
+            EngineLog.emit("[HLSVODIngest] R2542 playlist shape: " + shape.joined(separator: "; "),
+                           category: .engine)
+            guard let media else { return .native(ingestCanRetry: false) }
+
+            if !variantHasDemuxedAudio, let resolved = try? Self.resolvedMedia(media.playlist, url: media.url),
+               let first = resolved.segments.first,
+               let segmentURL = HLSPlaylistParser.resolve(uri: first.uri, against: resolved.url) {
+                let head = first.crypt == nil ? try await HLSCarriageProbe.classifySegmentHeadReportingTS(
+                    url: segmentURL,
+                    httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: segmentURL),
+                    session: reader.session) : nil
+                if head?.verdict == .hevcInMPEGTS {
+                    reader.condition.withLock { reader.resolved = resolved }
+                    accepted = true
+                    return .hevcInMPEGTS(reader)
+                }
+                if let file = PlaylistShape.singleFile(media.playlist, against: media.url) {
+                    return .singleFile(file)
+                }
+                // The ingest reads TS only: a head that parses as TS, or an encrypted `.ts` the probe
+                // cannot read.
+                let tsShaped = head?.isTransportStream
+                    ?? (segmentURL.pathExtension.lowercased() == "ts")
+                return .native(ingestCanRetry: tsShaped)
+            }
+            if !variantHasDemuxedAudio, let file = PlaylistShape.singleFile(media.playlist, against: media.url) {
+                return .singleFile(file)
+            }
+            return .native(ingestCanRetry: false)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            EngineLog.emit(
+                "[HLSVODIngest] carriage probe inconclusive: \(EngineLog.summary(of: error))",
+                category: .engine
+            )
+            return .native(ingestCanRetry: false)
+        }
+    }
+
+    /// R2542 (givo-25): the ingest for a playlist AVPlayer refused before any media arrived. No
+    /// carriage gate (the refusal is the evidence); the playlist rules still apply.
+    static func makeForIngestRetry(
+        playlistURL: URL,
+        httpHeaders: [String: String],
+        session: URLSession? = nil
+    ) async throws -> HLSVODIngestReader? {
+        let reader = HLSVODIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, session: session)
+        do {
+            let media = try await reader.resolveMedia()
+            reader.condition.withLock { reader.resolved = media }
+            return reader
+        } catch is CancellationError {
+            reader.close()
+            throw CancellationError()
+        } catch {
+            reader.close()
+            if Task.isCancelled { throw CancellationError() }
+            EngineLog.emit("[HLSVODIngest] R2542 ingest retry cannot read the playlist: "
+                           + EngineLog.summary(of: error), category: .engine)
+            return nil
+        }
+    }
+
     var mediaDuration: Double {
         condition.withLock { resolved?.duration ?? 0 }
     }
@@ -475,6 +585,12 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             mediaURL = selectedURL
         }
 
+        return try Self.resolvedMedia(media, url: mediaURL)
+    }
+
+    /// What the ingest can read of a finite media playlist; shared by `resolveMedia` and the R2542
+    /// verdict, which has already fetched the playlists.
+    private static func resolvedMedia(_ media: HLSMediaPlaylist, url mediaURL: URL) throws -> ResolvedMedia {
         guard media.hasEndList else {
             throw HLSIngestError.playlistInvalid(reason: "finite VOD requires EXT-X-ENDLIST")
         }
@@ -522,6 +638,13 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     }
 
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
+        let fetched = try await fetchPlaylistFacts(url)
+        return (fetched.playlist, fetched.url)
+    }
+
+    /// givo-25: the playlist with the two facts the parser drops and the R2542 shape line reports.
+    private func fetchPlaylistFacts(_ url: URL) async throws
+        -> (playlist: HLSPlaylist, url: URL, bytes: Int, byteRanges: Bool) {
         let (data, response) = try await BoundedPlaylistFetch.data(
             for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
@@ -531,7 +654,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         guard let text = String(data: data, encoding: .utf8) else {
             throw HLSIngestError.playlistInvalid(reason: "playlist is not bounded UTF-8")
         }
-        return (try HLSPlaylistParser.parse(text), response.url ?? url)
+        return (try HLSPlaylistParser.parse(text), response.url ?? url, data.count,
+                text.contains("#EXT-X-BYTERANGE"))
     }
 
     /// A segment or a key body, cut off at `limit` while it arrives (audit NET-112).

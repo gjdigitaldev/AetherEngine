@@ -421,6 +421,63 @@ final class Issue268HLSVODIngestTests: XCTestCase {
     }
 }
 
+/// R2542 (givo-25): the AE#154 verdict, widened past HEVC-in-TS. The field case was a finite master
+/// with one subtitle rendition that AVPlayer refused with CoreMediaErrorDomain -12971 before fetching
+/// any segment.
+extension Issue268HLSVODIngestTests {
+    func testR2542WrapperOfOneFileOpensTheFileDirectly() async throws {
+        let root = try XCTUnwrap(URL(string: "https://vod.test/wrap.m3u8"))
+        let file = try XCTUnwrap(URL(string: "https://vod.test/movie.mkv"))
+        Issue268URLProtocol.bodyByURL[root.absoluteString] = mediaPlaylist("movie.mkv")
+        Issue268URLProtocol.bodyByURL[file.absoluteString] = Data([0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0])
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        let verdict = try await HLSVODIngestReader.rerouteVerdict(
+            playlistURL: root, httpHeaders: [:], session: session)
+        guard case .singleFile(let url) = verdict else { return XCTFail("expected one file, got \(verdict)") }
+        XCTAssertEqual(url, file)
+    }
+
+    func testR2542H264TransportStreamStaysNativeWithOneIngestRetry() async throws {
+        let root = try XCTUnwrap(URL(string: "https://vod.test/master.m3u8"))
+        let media = try XCTUnwrap(URL(string: "https://vod.test/v.m3u8"))
+        Issue268URLProtocol.bodyByURL[root.absoluteString] = Data("""
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="subs/en.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=4000000,SUBTITLES="subs"
+        v.m3u8
+        """.utf8)
+        Issue268URLProtocol.bodyByURL[media.absoluteString] = mediaPlaylist(["a.ts", "b.ts"])
+        Issue268URLProtocol.bodyByURL["https://vod.test/a.ts"] = transportStream(streamType: 0x1B)
+        Issue268URLProtocol.bodyByURL["https://vod.test/b.ts"] = transportStream(streamType: 0x1B)
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        let verdict = try await HLSVODIngestReader.rerouteVerdict(
+            playlistURL: root, httpHeaders: [:], session: session)
+        guard case .native(let retry) = verdict else { return XCTFail("expected native, got \(verdict)") }
+        XCTAssertTrue(retry)
+
+        let reader = try await HLSVODIngestReader.makeForIngestRetry(
+            playlistURL: root, httpHeaders: [:], session: session)
+        let admitted = try XCTUnwrap(reader)
+        defer { admitted.close() }
+        XCTAssertEqual(admitted.mediaDuration, 12, accuracy: 0.001)
+    }
+
+    func testR2542FragmentedMP4SegmentsGetNoIngestRetry() async throws {
+        let root = try XCTUnwrap(URL(string: "https://vod.test/media.m3u8"))
+        Issue268URLProtocol.bodyByURL[root.absoluteString] = mediaPlaylist(["a.mp4", "b.mp4"])
+        Issue268URLProtocol.bodyByURL["https://vod.test/a.mp4"] =
+            Data([0x00, 0x00, 0x00, 0x1C, 0x66, 0x74, 0x79, 0x70])
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        let verdict = try await HLSVODIngestReader.rerouteVerdict(
+            playlistURL: root, httpHeaders: [:], session: session)
+        guard case .native(let retry) = verdict else { return XCTFail("expected native, got \(verdict)") }
+        XCTAssertFalse(retry)
+    }
+}
+
 final class Issue268URLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var bodyByURL: [String: Data] = [:]
     nonisolated(unsafe) static var headersByURL: [String: [String: String]] = [:]

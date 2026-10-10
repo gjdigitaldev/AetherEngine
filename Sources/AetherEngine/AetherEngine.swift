@@ -2602,6 +2602,9 @@ public final class AetherEngine: ObservableObject {
     /// route known cases straight onto the live-ingest loopback. Engine-lifetime by design: it must
     /// survive stop()/load() seams (zap away and back) or the discovery tax returns per retune.
     var rerouteVerdictMemory = RerouteVerdictMemory()
+    /// R2542 (givo-25): the finite playlist whose native mount gets one retry on the VOD ingest if
+    /// AVPlayer refuses it before any media arrives. Set by the AE#154 verdict, taken by the mount.
+    var vodIngestRetryPlaylistURL: URL?
     nonisolated static let itemDeathConfirmSeconds: TimeInterval = 3.0
 
     /// Single-shot latch for the reactive master->media fallback (#98): fall back at most once per
@@ -3921,11 +3924,42 @@ public final class AetherEngine: ObservableObject {
         generation: UInt64,
         evidence: String
     ) async throws -> HLSVODIngestReroute {
-        guard let reader = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+        let verdict = try await HLSVODIngestReader.rerouteVerdict(
             playlistURL: playlistURL,
             httpHeaders: options.httpHeaders
-        ) else { return .notTaken }
+        )
         try checkLoadCurrent(generation)
+        let reader: HLSVODIngestReader
+        switch verdict {
+        case .hevcInMPEGTS(let hevcReader):
+            reader = hevcReader
+        case .singleFile(let fileURL):
+            // R2542 (givo-25): the playlist wraps one progressive file. AVPlayer's HLS parser is the
+            // wrong reader for it; the loopback opens the file itself, with the identity headers the
+            // playlist's origin granted (credentials only where the playlist is, audit NET-7). A host
+            // refresher mints playlist addresses, never the file's, so it does not ride along.
+            EngineLog.emit(
+                "[AetherEngine] R2542: the finite playlist wraps one file; opening it on the loopback path "
+                + "instead of AVPlayer's HLS parser (givo-25)",
+                category: .engine
+            )
+            var fileOptions = options
+            fileOptions.nativeRemoteHLS = false
+            fileOptions.httpHeaders = RedirectHeaderPolicy.scoped(
+                options.httpHeaders, grantedFor: playlistURL, sentTo: fileURL)
+            fileOptions.sourceURLRefresher = nil
+            continueStartupAcrossReroute()
+            return .taken(try await load(
+                source: .url(fileURL),
+                startPosition: startPosition,
+                options: fileOptions,
+                audioSourceStreamIndex: audioSourceStreamIndex,
+                discTitleID: discTitleID
+            ))
+        case .native(let ingestCanRetry):
+            vodIngestRetryPlaylistURL = ingestCanRetry ? playlistURL : nil
+            return .notTaken
+        }
         EngineLog.emit(
             "[AetherEngine] AE#268: \(evidence); routing through the seekable TS -> fMP4 ingest",
             category: .engine

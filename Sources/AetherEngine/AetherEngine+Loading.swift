@@ -353,6 +353,9 @@ extension AetherEngine {
         playbackBackend = .native
         // #168 follow-up: detect a superseding load()/stop() between the carriage verdict and the reroute.
         let bypassGeneration = generation ?? loadGeneration
+        // R2542 (givo-25): armed by the AE#154 verdict for this playlist only, and taken here.
+        let armsVODIngestRetry = !options.isLive && vodIngestRetryPlaylistURL == url
+        vodIngestRetryPlaylistURL = nil
 
         let host: NativeAVPlayerHost
         if let existing = nativeHost {
@@ -472,6 +475,21 @@ extension AetherEngine {
                 }
             }
             .store(in: &nativeCancellables)
+        // R2542 (givo-25): AVPlayer refused a finite TS playlist before any media arrived (the field's
+        // CoreMediaErrorDomain -12971 with no access-log entry). The engine's own HLS reader is a
+        // different client of the same playlist, so the session gets one retry there; the host held
+        // the failure back and publishes it if the retry cannot start.
+        host.$remoteHLSVODRefusedBeforeMedia
+            .filter { $0 }
+            .prefix(1)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task { @MainActor in
+                    await self.rerouteRemoteHLSVODOntoIngest(url: url, options: options, startPosition: startPosition,
+                                                             expectedGeneration: bypassGeneration)
+                }
+            }
+            .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
         // settlePausedAtReadiness off when autostarting: the terminal host.play() runs, so readyToPlay is only a waypoint. Flipping to .paused here would drop the spinner during Jellyfin's ~10 s transcode spin-up. timeControlStatus sink holds .loading until AVPlayer renders.
         // #124: a paused mount (autoplay=false) skips that play(), so the readiness sink settles .loading -> .paused.
@@ -577,7 +595,8 @@ extension AetherEngine {
                       // AVFoundation builds no track, where nothing terminal is ever published.
                       readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds,
                       // No probe lists this route's audio, so the item's own tracks are the list.
-                      readsBackAudioTracks: true))
+                      readsBackAudioTracks: true,
+                      armVODIngestRetry: armsVODIngestRetry))   // givo-25
 
         attachRemoteHLSCueClock(host: host, expectedGeneration: bypassGeneration)
 
@@ -747,6 +766,43 @@ extension AetherEngine {
         } catch {
             // load() has already surfaced .error state on its failure paths; nothing to add here.
             EngineLog.emit("[AetherEngine] #168: ingest reroute load failed: \(error)", category: .engine)
+        }
+    }
+
+    /// R2542 (givo-25): one retry of a refused finite remote playlist on the VOD ingest (TS -> fMP4
+    /// remux), which reads the playlist with the load's own headers and drops renditions AVPlayer
+    /// would have fetched on its own.
+    @MainActor
+    private func rerouteRemoteHLSVODOntoIngest(url: URL, options: LoadOptions, startPosition: Double?,
+                                               expectedGeneration: UInt64) async {
+        guard loadGeneration == expectedGeneration else {
+            EngineLog.emit("[AetherEngine] R2542: ingest retry dropped (session superseded)", category: .engine)
+            return
+        }
+        EngineLog.emit(
+            "[AetherEngine] R2542: AVPlayer refused the finite playlist before any media arrived; "
+            + "retrying once on the engine's HLS reader (TS -> fMP4 remux) (givo-25)",
+            category: .engine
+        )
+        let reader = try? await HLSVODIngestReader.makeForIngestRetry(
+            playlistURL: url, httpHeaders: options.httpHeaders)
+        guard loadGeneration == expectedGeneration else {
+            reader?.close()
+            return
+        }
+        guard let reader else {
+            nativeHost?.releaseHeldStartupFailure()
+            return
+        }
+        var remuxOptions = options
+        remuxOptions.nativeRemoteHLS = false
+        do {
+            _ = try await load(source: .custom(reader, formatHint: "mpegts"), startPosition: startPosition,
+                               options: remuxOptions)
+        } catch is CancellationError {
+        } catch {
+            // load() has already surfaced .error state on its failure paths.
+            EngineLog.emit("[AetherEngine] R2542: ingest retry load failed: \(error)", category: .engine)
         }
     }
 

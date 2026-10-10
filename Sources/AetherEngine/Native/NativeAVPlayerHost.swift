@@ -185,6 +185,12 @@ final class NativeAVPlayerHost {
     /// AVFoundation user agent. Separate from the carriage signal because the evidence is different;
     /// a refusal is the origin's decision, not a verdict about what AVFoundation can demux.
     @Published private(set) var remoteHLSOriginRefused = false
+    /// R2542 (givo-25): fires once when AVPlayer refused an armed finite playlist (CoreMedia error)
+    /// before any media byte arrived. The engine retries on its VOD ingest; the failure is held in
+    /// `heldStartupFailure` until it either starts or gives up.
+    @Published private(set) var remoteHLSVODRefusedBeforeMedia = false
+    private var vodIngestRetryArmed = false
+    private var heldStartupFailure: PlaybackErrorInfo?
     /// Set per load; arms both live-ingest fallbacks. The carriage watchdog itself starts at
     /// readyToPlay (a dead origin never reaches it), the refusal path fires before readiness.
     private var ingestFallbackArmed = false
@@ -428,6 +434,9 @@ final class NativeAVPlayerHost {
         /// Read the item's audio tracks back into `detectedAudioTracks`. Only the remote-HLS bypass needs
         /// them; the loopback's probe already listed its audio, and the reads are XPC round trips.
         var readsBackAudioTracks: Bool = false
+        /// R2542 (givo-25): a finite TS playlist the engine's VOD ingest can read; a CoreMedia refusal
+        /// before any media arrived is handed to the engine instead of published.
+        var armVODIngestRetry: Bool = false
     }
 
     /// AE#446 round 5: a fresh item is about to attach, invoked before anything can fetch a playlist
@@ -477,6 +486,7 @@ final class NativeAVPlayerHost {
         let armIngestFallback = contract.armIngestFallback
         self.surfaceEndFailures = contract.surfaceEndFailures
         self.ingestFallbackArmed = armIngestFallback
+        self.vodIngestRetryArmed = contract.armVODIngestRetry   // givo-25
         self.readinessDeadlineSeconds = contract.readinessDeadline
         self.isLiveSession = contract.isLive
         // AE#440: per load, and only ever armed for a live session. The player is reused across loads,
@@ -964,6 +974,25 @@ final class NativeAVPlayerHost {
         !surfaceEndFailures && hasEverPlayed
     }
 
+    /// R2542 (givo-25) pure decision: whether a startup failure goes to the VOD ingest retry. A
+    /// CoreMedia verdict on a playlist that delivered no media; a URL-loading failure is the origin's
+    /// answer, which the ingest would get too.
+    nonisolated static func handsRefusalToVODIngest(armed: Bool, errorDomain: String?,
+                                                    mediaBytesArrived: Bool) -> Bool {
+        armed && errorDomain == SoftwarePathEscalation.mediaErrorDomain && !mediaBytesArrived
+    }
+
+    private static func mediaBytesArrived(_ item: AVPlayerItem) -> Bool {
+        (item.accessLog()?.events ?? []).contains { $0.numberOfBytesTransferred > 0 }
+    }
+
+    /// R2542 (givo-25): the VOD ingest retry could not start, so the refusal it held is the answer.
+    func releaseHeldStartupFailure() {
+        guard let held = heldStartupFailure else { return }
+        heldStartupFailure = nil
+        failure = held
+    }
+
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
     /// Discriminates on hasEverPlayed, not instantaneous timeControlStatus: .failed and timeControlStatus KVOs are unsynchronized (426b45c: still published terminal failure at 27.3s while AVPlayer played smoothly).
     /// Before first .playing: surface promptly (genuine startup failure). After: defer 5s and confirm -- clear if .playing or clock advanced, surface if both stopped.
@@ -1038,6 +1067,22 @@ final class NativeAVPlayerHost {
                 pendingDisplayRejection = DisplayRejection(code: code,
                                                            message: desc,
                                                            domain: (item.error as NSError?)?.domain)
+                return
+            }
+            // R2542 (givo-25): a finite TS playlist AVPlayer refused before any media arrived gets
+            // one retry on the engine's VOD ingest; the failure waits for that retry's outcome.
+            if Self.handsRefusalToVODIngest(armed: vodIngestRetryArmed,
+                                            errorDomain: (item.error as NSError?)?.domain,
+                                            mediaBytesArrived: Self.mediaBytesArrived(item)) {
+                vodIngestRetryArmed = false
+                heldStartupFailure = Self.itemFailureInfo(desc: desc, itemError: item.error,
+                                                          relayRefusalCode: upstreamTrustRefusal?())
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) AVPlayer refused the finite playlist "
+                    + "(\((item.error as NSError?)?.domain ?? "?")/\((item.error as NSError?)?.code ?? 0)) before any "
+                    + "media arrived; handing it to the engine's VOD ingest once (R2542/givo-25)",
+                    category: .engine)
+                remoteHLSVODRefusedBeforeMedia = true
                 return
             }
             // AE#561: a startup failure on the media itself (a segment Apple's parser refuses) is
@@ -2243,6 +2288,9 @@ final class NativeAVPlayerHost {
         ingestFallbackArmed = false
         remoteHLSVideoCarriageRejected = false
         remoteHLSOriginRefused = false
+        vodIngestRetryArmed = false   // givo-25
+        remoteHLSVODRefusedBeforeMedia = false
+        heldStartupFailure = nil
         carriageProbeTask?.cancel()
         carriageProbeTask = nil
         carriageProbeEvidence = .pending

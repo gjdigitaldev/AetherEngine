@@ -131,6 +131,16 @@ enum HLSCarriageProbe {
         httpHeaders: [String: String],
         session: URLSession
     ) async throws -> MPEGTransportStreamCodecProbe.Verdict {
+        try await classifySegmentHeadReportingTS(url: url, httpHeaders: httpHeaders, session: session).verdict
+    }
+
+    /// The same read, also saying whether the head is MPEG-TS at all (R2542/givo-25): `otherCarriage`
+    /// covers both a TS that declares a codec AVPlayer carries and something that is not TS.
+    static func classifySegmentHeadReportingTS(
+        url: URL,
+        httpHeaders: [String: String],
+        session: URLSession
+    ) async throws -> (verdict: MPEGTransportStreamCodecProbe.Verdict, isTransportStream: Bool) {
         var request = makeRequest(url, httpHeaders: httpHeaders)
         request.setValue("bytes=0-\(maximumSegmentHeadBytes - 1)", forHTTPHeaderField: "Range")
         let (bytes, response) = try await session.bytes(for: request)
@@ -146,14 +156,14 @@ enum HLSCarriageProbe {
             data.append(byte)
             guard data.count >= nextVerdictAt else { continue }
             let verdict = MPEGTransportStreamCodecProbe.classify(data)
-            if verdict != .inconclusive { return verdict }
+            if verdict != .inconclusive { return (verdict, LiveSegmentFormat.classify(data) == .mpegts) }
             guard data.count < maximumSegmentHeadBytes else { break }
             nextVerdictAt = min(maximumSegmentHeadBytes, data.count + segmentHeadChunkBytes)
         }
         guard !data.isEmpty else {
             throw HLSIngestError.unsupportedSegmentFormat
         }
-        return MPEGTransportStreamCodecProbe.classify(data)
+        return (MPEGTransportStreamCodecProbe.classify(data), LiveSegmentFormat.classify(data) == .mpegts)
     }
 
     /// Resolves the playlist down to the segment whose PMT answers the question, or settles the verdict

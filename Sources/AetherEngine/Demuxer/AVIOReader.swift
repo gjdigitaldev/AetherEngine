@@ -1610,7 +1610,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#495: record a TLS trust refusal off any task of this reader, and name it once in the log.
     /// Everything else is left to the caller's own error handling; this only classifies.
     func noteTransportSecurityFailure(_ error: Error?) {
-        guard let code = TransportSecurityFailure.code(in: error) else { return }
+        // givo-14: a cancel is a trust refusal only on a reader we did not close ourselves.
+        guard let code = TransportSecurityFailure.code(in: error)
+                ?? (isClosed ? nil : TransportSecurityFailure.code(in: error, origin: requestURL())) else { return }
         streamLock.lock()
         let first = transportSecurityCode == 0
         transportSecurityCode = code

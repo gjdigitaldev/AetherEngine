@@ -31,6 +31,47 @@ public enum EngineTLS {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var _evaluator: (@Sendable (URLProtectionSpace) -> Bool)?
 
+    /// givo-14: what to do with a server certificate, decided by the host before anything else.
+    public enum ServerTrustDecision: Sendable, Equatable {
+        /// Trust it, whatever system evaluation would say.
+        case accept
+        /// Refuse it, even one system evaluation would accept (a pinned origin presenting another
+        /// certificate). The connection fails as a certificate rejection, never as a plain cancel.
+        case reject
+        /// No opinion: `serverTrustEvaluator`, then the system's default handling.
+        case systemDefault
+    }
+
+    /// givo-14: a three-way answer per challenge, asked before `serverTrustEvaluator`. A host pinning
+    /// one origin's certificate needs `.reject`, which the Bool evaluator cannot say: `false` there is
+    /// the system's default handling, and that accepts any certificate the system trusts. nil, the
+    /// default, asks nothing. Same threading rules as `serverTrustEvaluator`.
+    public static var serverTrustDecision: (@Sendable (URLProtectionSpace) -> ServerTrustDecision)? {
+        get { lock.lock(); defer { lock.unlock() }; return _decision }
+        set { lock.lock(); _decision = newValue; lock.unlock() }
+    }
+    nonisolated(unsafe) private static var _decision: (@Sendable (URLProtectionSpace) -> ServerTrustDecision)?
+
+    /// givo-14: origins (host and port) whose certificate a `.reject` refused, and when. URLSession
+    /// reports a cancelled challenge as a plain cancel (-999); the readers read it as a trust refusal by
+    /// this record.
+    nonisolated(unsafe) private static var refusedOrigins: [String: Date] = [:]
+    static let refusalMemorySeconds: TimeInterval = 10
+
+    static func originKey(host: String, port: Int) -> String { "\(host.lowercased()):\(port)" }
+
+    static func noteRefused(host: String, port: Int) {
+        lock.lock(); refusedOrigins[originKey(host: host, port: port)] = Date(); lock.unlock()
+    }
+
+    static func refusedRecently(_ url: URL?) -> Bool {
+        guard let url, let host = url.host else { return false }
+        let port = url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80)
+        lock.lock(); defer { lock.unlock() }
+        guard let at = refusedOrigins[originKey(host: host, port: port)] else { return false }
+        return Date().timeIntervalSince(at) < refusalMemorySeconds
+    }
+
     /// givo-10: every redirect an engine request is about to follow, as (the request's original
     /// URL, the next hop), before the hop is requested. A host that answers `serverTrustEvaluator`
     /// for one origin can then answer for the hosts that origin redirects to, and for no other.
@@ -60,6 +101,24 @@ public enum EngineTLS {
         _ challenge: URLAuthenticationChallenge,
         completionHandler: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
+        // givo-14: the host's three-way answer first.
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           let decide = serverTrustDecision {
+            switch decide(challenge.protectionSpace) {
+            case .accept:
+                if let trust = challenge.protectionSpace.serverTrust {
+                    completionHandler(.useCredential, URLCredential(trust: trust))
+                    return
+                }
+            case .reject:
+                noteRefused(host: challenge.protectionSpace.host, port: challenge.protectionSpace.port)
+                EngineLog.emit("[EngineTLS] the host refused this origin's certificate (givo-14)", category: .demux)
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            case .systemDefault:
+                break
+            }
+        }
         guard
             challenge.protectionSpace.authenticationMethod
                 == NSURLAuthenticationMethodServerTrust,

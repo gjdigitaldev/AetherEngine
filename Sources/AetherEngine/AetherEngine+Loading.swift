@@ -651,7 +651,7 @@ extension AetherEngine {
     private func prepareRemoteHLSStandIn(originURL: URL,
                                          options: LoadOptions,
                                          expectedGeneration: UInt64) async -> URL? {
-        let mayNeedRelay = EngineTLS.serverTrustEvaluator != nil
+        let mayNeedRelay = (EngineTLS.serverTrustEvaluator != nil || EngineTLS.serverTrustDecision != nil)   // givo-14
             && originURL.scheme?.lowercased() == "https"
         let tracks = options.isLive
             ? []

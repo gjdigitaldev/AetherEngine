@@ -108,6 +108,55 @@
                     "open failed as \(String(describing: refusal)), not a trust refusal")
         }
 
+        /// givo-14: a pinned origin presenting another certificate is refused even where the Bool
+        /// evaluator (or the system) would accept it, and the refusal reads as a trust refusal, not as
+        /// the plain cancel URLSession reports for a cancelled challenge.
+        @Test("A .reject decision wins over an accepting evaluator and fails the open as a trust refusal")
+        func rejectDecisionRefusesTyped() async throws {
+            let server = try #require(await SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous; EngineTLS.serverTrustDecision = nil }
+            EngineTLS.serverTrustEvaluator = { _ in true }
+            // Scoped to this origin's port: the resolver suite may run beside this one.
+            let port = Int(server.port)
+            EngineTLS.serverTrustDecision = { $0.port == port ? .reject : .systemDefault }
+
+            let reader = AVIOReader(
+                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                chunkRequestTimeout: 5, chunkMaxRetries: 1)
+            defer { reader.markClosed(); reader.close() }
+            let refusal = Self.openFailure(of: reader)
+
+            try await Task.sleep(for: .seconds(1))
+            #expect(server.requestsServed == 0, "a request crossed a handshake the host rejected")
+            #expect(Self.isTrustRefusal(refusal),
+                    "open failed as \(String(describing: refusal)), not a trust refusal")
+        }
+
+        @Test("An .accept decision serves the reader with no evaluator set")
+        func acceptDecisionServes() async throws {
+            let server = try #require(await SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous; EngineTLS.serverTrustDecision = nil }
+            EngineTLS.serverTrustEvaluator = nil
+            let port = Int(server.port)
+            EngineTLS.serverTrustDecision = { $0.port == port ? .accept : .systemDefault }
+
+            let reader = AVIOReader(
+                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                chunkRequestTimeout: 10, chunkMaxRetries: 2)
+            defer { reader.markClosed(); reader.close() }
+            try reader.open()
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+            defer { buf.deallocate() }
+            #expect(reader.read(into: buf, size: 4096) > 0)
+            #expect(server.requestsServed > 0)
+        }
+
         @Test("Through the relay: a client that never sees the certificate gets the stream")
         func relayServesThroughUntrustedOrigin() async throws {
             let origin = try #require(await SelfSignedHLSOrigin())

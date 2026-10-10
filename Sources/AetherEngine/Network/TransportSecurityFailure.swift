@@ -47,6 +47,16 @@ enum TransportSecurityFailure {
         return nil
     }
 
+    /// givo-14: the same, also reading a plain cancel (-999) as an untrusted certificate when the host's
+    /// `EngineTLS.serverTrustDecision` refused the certificate of `origin` (host and port) in the last
+    /// few seconds: a cancelled challenge reaches the task only as a cancel.
+    static func code(in error: Error?, origin: URL?) -> Int? {
+        if let code = code(in: error) { return code }
+        guard let nsError = error as NSError?, nsError.domain == NSURLErrorDomain,
+              nsError.code == NSURLErrorCancelled, EngineTLS.refusedRecently(origin) else { return nil }
+        return NSURLErrorServerCertificateUntrusted
+    }
+
     /// Whether an error carries a trust refusal anywhere in its chain.
     static func isTrustFailure(_ error: Error?) -> Bool {
         code(in: error) != nil

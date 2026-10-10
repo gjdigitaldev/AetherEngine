@@ -189,6 +189,15 @@ final class NativeAVPlayerHost {
     /// before any media byte arrived. The engine retries on its VOD ingest; the failure is held in
     /// `heldStartupFailure` until it either starts or gives up.
     @Published private(set) var remoteHLSVODRefusedBeforeMedia = false
+    /// givo-26: from a tolerant first seek leg's issue to the exact second leg's completion. The
+    /// periodic observer publishes neither clock meanwhile: the keyframe the first leg lands on is not
+    /// the frame the seek asked for, and a late-landing check takes a frame within 5 s of the target
+    /// for the landing. The `.paused` the rate hold causes is not a pause.
+    private var seekBridgeInFlight = false
+    /// givo-26: the first leg is on its keyframe with the rate held at 0, waiting for the loaded range
+    /// to reach the target; the exact leg follows by itself. The engine's seek deadline waits on it
+    /// instead of re-seeking.
+    private(set) var seekBridgeHoldsKeyframe = false
     private var vodIngestRetryArmed = false
     private var heldStartupFailure: PlaybackErrorInfo?
     /// Set per load; arms both live-ingest fallbacks. The carriage watchdog itself starts at
@@ -731,7 +740,7 @@ final class NativeAVPlayerHost {
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
-                if status == .paused, self.prematureEndRecoveryInFlight { return }
+                if status == .paused, self.prematureEndRecoveryInFlight || self.seekBridgeInFlight { return }
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
@@ -861,7 +870,7 @@ final class NativeAVPlayerHost {
             let value = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
-                if self.mountSeekPending { return }
+                if self.mountSeekPending || self.seekBridgeInFlight { return }
                 // renderedTime tracks the parked on-screen frame mid-seek (issue #49).
                 self.renderedTime = value
                 // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
@@ -1968,11 +1977,20 @@ final class NativeAVPlayerHost {
     /// `avPlayer.seek` is NOT cancelled (it lands later if it ever can), but `seekInFlight` is cleared for the
     /// latest generation so the periodic observer resumes publishing AVPlayer's real position, letting the
     /// engine reconcile a clock that would otherwise stay latched at an unreachable optimistic target.
+    ///
+    /// givo-26: `toleranceBefore` > 0 makes it two legs. An exact seek makes AVPlayer fetch from about
+    /// 15 s before the target, whole segment by whole segment, before the target's own; on a slow
+    /// loopback that is most of the seek (lab, 1.3 MB/s: the picture moved after 29 s). The first leg
+    /// lands on the keyframe that starts the target's segment, which AVPlayer asks for first; the rate
+    /// is held at 0 there until the loaded range covers the target; the second, exact leg is then
+    /// served from what AVPlayer holds (an exact leg issued before that re-runs the look-back). Only
+    /// the second leg's completion is this seek's completion.
     @discardableResult
-    func seek(to seconds: Double, deadlineSeconds: Double?) async -> Bool {
+    func seek(to seconds: Double, deadlineSeconds: Double?, toleranceBefore: Double = 0) async -> Bool {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
         seekGeneration &+= 1
         let gen = seekGeneration
+        endSeekBridge()
         seekInFlight = true
         // AE#629: this seek's own landing publishes the clock from here on.
         mountSeekPending = false
@@ -1990,7 +2008,10 @@ final class NativeAVPlayerHost {
                 }
             }
             // Zero tolerances: unbounded tolerances caused AVPlayer to land on arbitrary sync samples for loopback HLS-fMP4 (openradar 44904505).
-            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player = avPlayer] finished in
+            // givo-26's first leg is bounded to the target's own segment, so the sync sample it can land on is that segment's start.
+            let exactLeg: @MainActor () -> Void = { [weak self] in
+            guard let self else { if resumeGuard.claim() { cont.resume(returning: false) }; return }
+            self.avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player = self.avPlayer] finished in
                 // Sample at completion, before a busy main actor can let playback advance far
                 // enough to make a successful seek appear to have missed the target.
                 let actual = player?.currentTime().seconds ?? .nan
@@ -2023,11 +2044,96 @@ final class NativeAVPlayerHost {
                         }
                     }
                     EngineLog.emit("[NativeAVPlayerHost] seek completion target=\(String(format: "%.2f", seconds)) actual=\(String(format: "%.2f", actual)) finished=\(finished) landed=\(landed) current=\(gen == self.seekGeneration)", category: .engine)
+                    if gen == self.seekGeneration { self.endSeekBridge() }
                     if resumeGuard.claim() { cont.resume(returning: landed) }
+                }
+            }
+            }
+            guard toleranceBefore > 0, let item = playerItem else {
+                exactLeg()
+                return
+            }
+            let before = CMTime(seconds: toleranceBefore, preferredTimescale: 600)
+            let issued = DispatchTime.now()
+            seekBridgeInFlight = true
+            avPlayer.seek(to: target, toleranceBefore: before, toleranceAfter: .zero) { [weak self, weak player = avPlayer] finished in
+                let actual = player?.currentTime().seconds ?? .nan
+                Task { @MainActor in
+                    guard let self, gen == self.seekGeneration, self.playerItem === item else {
+                        if resumeGuard.claim() { cont.resume(returning: false) }
+                        return
+                    }
+                    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - issued.uptimeNanoseconds) / 1_000_000_000
+                    guard Self.tolerantLegLanded(finished: finished, actual: actual, target: seconds,
+                                                 toleranceBefore: toleranceBefore) else {
+                        EngineLog.emit("[NativeAVPlayerHost] givo-26 first leg did not land (finished=\(finished) "
+                                       + "actual=\(String(format: "%.2f", actual))); exact seek to "
+                                       + "\(String(format: "%.2f", seconds))", category: .engine)
+                        exactLeg()
+                        return
+                    }
+                    EngineLog.emit("[NativeAVPlayerHost] givo-26 first leg on the keyframe at "
+                                   + "\(String(format: "%.2f", actual))s after \(String(format: "%.2f", elapsed))s; holding "
+                                   + "there until the loaded range covers \(String(format: "%.2f", seconds))s", category: .engine)
+                    self.holdKeyframeForBridge()
+                    let covered = await self.awaitLoadedRange(covering: seconds, item: item, generation: gen)
+                    guard gen == self.seekGeneration, self.playerItem === item else {
+                        if resumeGuard.claim() { cont.resume(returning: false) }
+                        return
+                    }
+                    self.seekBridgeHoldsKeyframe = false
+                    let waited = Double(DispatchTime.now().uptimeNanoseconds - issued.uptimeNanoseconds) / 1_000_000_000
+                    EngineLog.emit("[NativeAVPlayerHost] givo-26 "
+                                   + (covered ? "target loaded" : "target not loaded in time")
+                                   + " after \(String(format: "%.2f", waited))s; exact second leg", category: .engine)
+                    exactLeg()
                 }
             }
         }
     }
+
+    /// givo-26: the first leg landed when it reached the window it was given: the target, or a sync
+    /// sample at most `toleranceBefore` before it.
+    nonisolated static func tolerantLegLanded(finished: Bool, actual: Double, target: Double,
+                                              toleranceBefore: Double) -> Bool {
+        finished && actual.isFinite && target.isFinite
+            && actual >= target - toleranceBefore - 0.75 && actual <= target + 0.75
+    }
+
+    private func holdKeyframeForBridge() {
+        seekBridgeHoldsKeyframe = true
+        if avPlayer.rate != 0 { avPlayer.rate = 0 }
+    }
+
+    /// Idempotent: a newer seek, the second leg's completion and an unload all end it.
+    private func endSeekBridge() {
+        guard seekBridgeInFlight else { return }
+        seekBridgeInFlight = false
+        seekBridgeHoldsKeyframe = false
+        if playIntent, avPlayer.rate == 0 { avPlayer.play() }
+    }
+
+    /// givo-26: wait, off the main thread's reads, until the item's loaded range covers `seconds`.
+    /// Bounded: a source that never delivers the target leaves it to the exact leg and the engine's
+    /// seek deadline, which is where a stalled seek was handled before.
+    private func awaitLoadedRange(covering seconds: Double, item: AVPlayerItem, generation: UInt64) async -> Bool {
+        let deadline = DispatchTime.now() + .seconds(Int(Self.seekBridgeMaxSeconds))
+        while DispatchTime.now() < deadline {
+            let ranges = await AVFoundationOffMain.read(item, on: Self.offMainReadQueue) { item in
+                item.loadedTimeRanges.map { value -> (Double, Double) in
+                    let range = value.timeRangeValue
+                    return (range.start.seconds, (range.start + range.duration).seconds)
+                }
+            }
+            if ranges.contains(where: { $0.0 <= seconds + 0.05 && $0.1 >= seconds + 0.1 }) { return true }
+            guard generation == seekGeneration, playerItem === item else { return false }
+            do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return false }
+        }
+        return false
+    }
+
+    /// givo-26: the longest the rate is held on the first leg's keyframe.
+    static let seekBridgeMaxSeconds: Double = 60
 
     /// A callback can report an interrupted seek or a clamp to the old position. Neither is a
     /// landing. Allow sub-second clock rounding, but never accept an unrelated playhead merely
@@ -2234,6 +2340,8 @@ final class NativeAVPlayerHost {
     }
 
     private func unloadCurrentItem(inPlaceSwap: Bool = false) {
+        // givo-26: a bridge's held rate must not outlive the item it was held for.
+        endSeekBridge()
         // Invalidating KVO does not cancel callbacks already queued onto the main actor. Retire
         // their session now so they drop on their `sessionID == sid` guard, including during the
         // handover gap where the old item is still attached and still producing them.

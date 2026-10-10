@@ -4205,6 +4205,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return min(max(lo - 1, 0), segmentPlan.count - 1)
     }
 
+    /// givo-26: how far before an exact seek target AVPlayer starts fetching. Lab (aetherctl, 10 s
+    /// segments, zero tolerance): the first request was the segment holding the target minus about
+    /// 15 s, whether the target sat mid-segment or exactly on a segment start; a margin past that.
+    nonisolated static let exactSeekLookbackSeconds: Double = 16
+
+    /// givo-26: the start of the plan segment that holds `itemSeconds`, when part of an exact seek's
+    /// look-back would have to come from the producer; nil when all of it is resident in the segment
+    /// cache (an exact seek then costs nothing it would not anyway), on live, or with no plan. Checks
+    /// the cache's files, so it runs off the main actor.
+    func tolerantSeekLegStart(itemSeconds: Double) -> Double? {
+        guard !isLiveSession, let cache, itemSeconds.isFinite else { return nil }
+        let targetIndex = segmentIndexForPlaylistTime(itemSeconds)
+        let firstIndex = segmentIndexForPlaylistTime(max(0, itemSeconds - Self.exactSeekLookbackSeconds))
+        restartLock.lock()
+        let start: Double? = targetIndex < segmentPlan.count ? segmentPlan[targetIndex].startSeconds : nil
+        restartLock.unlock()
+        guard let start, firstIndex <= targetIndex else { return nil }
+        let resident = (firstIndex...targetIndex).allSatisfy { cache.peekURL(index: $0) != nil }
+        return resident ? nil : start
+    }
+
     /// AE#141: whether the active producer's march can plausibly deliver the segment covering
     /// playlist time `seconds` without a re-anchor. The seek-deadline path asks this before
     /// preserving a "progressing" producer: progress toward a region the pending target is not

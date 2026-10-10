@@ -721,7 +721,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             break  // reloadlive handled at load time, seekback/overlapseek/pauseseek in the telemetry loop
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
-        case let call where call.hasPrefix("seekfar") || call.hasPrefix("subsoff")
+        case let call where call.hasPrefix("seekfar") || call.hasPrefix("seeknear") || call.hasPrefix("avseek") || call.hasPrefix("seekto@")
+            || call.hasPrefix("handover@") || call.hasPrefix("subsoff")
             || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
@@ -906,6 +907,29 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     let seekFarTick: Int? = hostCalls.first(where: { $0.hasPrefix("seekfar") }).map { call in
         let parts = call.split(separator: "@")
         return parts.count == 2 ? (Int(parts[1]) ?? 15) : 15
+    }
+
+    let avSeekSpec: (tick: Int, target: Double, before: Double)? = hostCalls.first(where: { $0.hasPrefix("avseek@") }).map { call in
+        let spec = call.split(separator: "@").dropFirst().joined().split(separator: ":")
+        return (Int(spec.first ?? "") ?? 16, spec.count > 1 ? (Double(spec[1]) ?? 150) : 150,
+                spec.count > 2 ? (Double(spec[2]) ?? 0) : 0)
+    }
+    let avSeek2Spec: (tick: Int, target: Double, segmentStart: Double, mode: String)? = hostCalls
+        .first(where: { $0.hasPrefix("avseek2") }).map { call in
+            let spec = call.split(separator: "@").dropFirst().joined().split(separator: ":")
+            return (Int(spec.first ?? "") ?? 16, spec.count > 1 ? (Double(spec[1]) ?? 153) : 153,
+                    spec.count > 2 ? (Double(spec[2]) ?? 150) : 150, spec.count > 3 ? String(spec[3]) : "i")
+        }
+    let seekToSpecs: [(tick: Int, target: Double)] = hostCalls.filter { $0.hasPrefix("seekto@") }.compactMap { call in
+        let spec = call.split(separator: "@").dropFirst().joined().split(separator: ":")
+        guard spec.count == 2, let tick = Int(spec[0]), let target = Double(spec[1]) else { return nil }
+        return (tick, target)
+    }
+    let handoverTick: Int? = hostCalls.first(where: { $0.hasPrefix("handover@") })
+        .flatMap { Int($0.split(separator: "@").last ?? "") }
+    let seekNearSpec: (tick: Int, ahead: Double)? = hostCalls.first(where: { $0.hasPrefix("seeknear") }).map { call in
+        let spec = call.split(separator: "@").dropFirst().joined().split(separator: ":")
+        return (Int(spec.first ?? "") ?? 15, spec.count > 1 ? (Double(spec[1]) ?? 25) : 25)
     }
 
     // Sodalite#156: a host turning subtitles OFF and back ON mid-session, which is the transition the
@@ -1132,6 +1156,115 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             print(String(format: "  HOSTCALL seek(to: %.2f) (past bufferedPosition %.2f, so the landing needs a producer restart)",
                          target, engine.bufferedPosition))
             await engine.seek(to: target)
+        }
+        // givo-24: a seek a little past `bufferedPosition`, inside the provider's forward-wait window, so
+        // the landing is either the march's or a restart's. `seeknear@N:S` seeks S seconds past it at N.
+        if let near = seekNearSpec, tick == near.tick {
+            let target = min(engine.bufferedPosition + near.ahead, max(0, engine.duration - 5))
+            print(String(format: "  HOSTCALL seek(to: %.2f) (%.0f s past bufferedPosition %.2f, inside the forward-wait window)",
+                         target, near.ahead, engine.bufferedPosition))
+            await engine.seek(to: target)
+        }
+        // givo-26 lab: a seek issued on the AVPlayer itself, so its tolerance and its target can be
+        // chosen (`avseek@N:T:B` seeks to T at tick N with toleranceBefore B s). Which segment AVPlayer
+        // asks for first, and when the picture is moving again, is what the lab compares.
+        if let av = avSeekSpec, tick == av.tick, let player = engine.currentAVPlayer {
+            let issued = Date()
+            print(String(format: "  HOSTCALL avseek(to: %.2f, toleranceBefore: %.1f)", av.target, av.before))
+            let target = CMTime(seconds: av.target, preferredTimescale: 600)
+            let before = CMTime(seconds: av.before, preferredTimescale: 600)
+            Task { @MainActor in
+                let finished = await player.seek(to: target, toleranceBefore: before, toleranceAfter: .zero)
+                print(String(format: "  AVSEEK completion finished=%@ after %.2f s at %.2f", finished ? "yes" : "no",
+                             Date().timeIntervalSince(issued), player.currentTime().seconds))
+                var lastTime = player.currentTime().seconds
+                for _ in 0..<1200 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    let now = player.currentTime().seconds
+                    if player.timeControlStatus == .playing, now > lastTime + 0.02, now >= av.target - av.before - 0.5 {
+                        print(String(format: "  AVSEEK picture moving after %.2f s at %.2f", Date().timeIntervalSince(issued), now))
+                        break
+                    }
+                    lastTime = now
+                }
+            }
+        }
+        // givo-26 lab: two legs on the AVPlayer: a tolerant first leg to the keyframe that starts the
+        // target's segment (`S` = that start), then an exact second leg, issued at once (`i`) or once the
+        // loaded range covers the target with the rate held at 0 in between (`w`).
+        if let two = avSeek2Spec, tick == two.tick, let player = engine.currentAVPlayer, let item = player.currentItem {
+            let issued = Date()
+            let before = max(0.5, two.target - two.segmentStart)
+            print(String(format: "  HOSTCALL avseek2(to: %.2f, leg 1 toleranceBefore %.2f, mode %@)", two.target, before, two.mode))
+            Task { @MainActor in
+                let target = CMTime(seconds: two.target, preferredTimescale: 600)
+                let leg1 = await player.seek(to: target, toleranceBefore: CMTime(seconds: before, preferredTimescale: 600),
+                                             toleranceAfter: .zero)
+                print(String(format: "  AVSEEK2 leg 1 finished=%@ after %.2f s at %.2f", leg1 ? "yes" : "no",
+                             Date().timeIntervalSince(issued), player.currentTime().seconds))
+                if two.mode == "w" {
+                    let rate = player.rate
+                    player.rate = 0
+                    for _ in 0..<1200 {
+                        let covered = item.loadedTimeRanges.map(\.timeRangeValue).contains {
+                            $0.start.seconds <= two.target && ($0.start + $0.duration).seconds >= two.target + 0.1
+                        }
+                        if covered { break }
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                    print(String(format: "  AVSEEK2 target loaded after %.2f s", Date().timeIntervalSince(issued)))
+                    let leg2 = await player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                    player.rate = rate == 0 ? 1 : rate
+                    print(String(format: "  AVSEEK2 leg 2 finished=%@ after %.2f s at %.2f", leg2 ? "yes" : "no",
+                                 Date().timeIntervalSince(issued), player.currentTime().seconds))
+                } else {
+                    let leg2 = await player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                    print(String(format: "  AVSEEK2 leg 2 finished=%@ after %.2f s at %.2f", leg2 ? "yes" : "no",
+                                 Date().timeIntervalSince(issued), player.currentTime().seconds))
+                }
+                var lastTime = player.currentTime().seconds
+                for _ in 0..<1200 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    let now = player.currentTime().seconds
+                    if player.timeControlStatus == .playing, now > lastTime + 0.02, now >= two.target - 0.5 {
+                        print(String(format: "  AVSEEK2 picture moving after %.2f s at %.2f", Date().timeIntervalSince(issued), now))
+                        break
+                    }
+                    lastTime = now
+                }
+            }
+        }
+        // givo-26 lab: engine seeks at chosen ticks (`seekto@N:T`, repeatable) and the in-place item
+        // handover a PiP window forces (`handover@N`: prepareForItemReplacement + reload at position).
+        for spec in seekToSpecs where spec.tick == tick {
+            print(String(format: "  HOSTCALL seek(to: %.2f) at t=%d", spec.target, tick))
+            let issued = Date()
+            let before = engine.currentTime
+            Task { @MainActor in
+                await engine.seek(to: spec.target)
+                print(String(format: "  SEEKTO %.2f returned after %.2f s (state=%@)", spec.target,
+                             Date().timeIntervalSince(issued), String(describing: engine.state)))
+                var last = engine.currentAVPlayer?.currentTime().seconds ?? .nan
+                for _ in 0..<1200 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    guard let player = engine.currentAVPlayer else { continue }
+                    let now = player.currentTime().seconds
+                    if player.timeControlStatus == .playing, now > last + 0.02, abs(now - spec.target) < 3 {
+                        print(String(format: "  SEEKTO %.2f picture moving after %.2f s at %.2f (from %.2f)", spec.target,
+                                     Date().timeIntervalSince(issued), now, before))
+                        break
+                    }
+                    last = now
+                }
+            }
+        }
+        if let handoverTick, tick == handoverTick {
+            print(String(format: "  HOSTCALL prepareForItemReplacement + reloadAtCurrentPosition at %.2f", engine.currentTime))
+            engine.prepareForItemReplacement()
+            Task { @MainActor in
+                do { try await engine.reloadAtCurrentPosition() } catch { print("  HANDOVER reload failed: \(error)") }
+                print(String(format: "  HANDOVER reloaded at %.2f state=%@", engine.currentTime, String(describing: engine.state)))
+            }
         }
         if hostCalls.contains("seekback"), tick == 30 {
             print("  HOSTCALL seekToLiveEdge()")

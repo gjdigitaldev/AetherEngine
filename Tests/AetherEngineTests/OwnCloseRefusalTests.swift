@@ -174,6 +174,8 @@ struct FaultedConnectionRefusalTests {
         let url = URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
         let reader = AVIOReader(url: url, heldConnection: held)
         defer { reader.markClosed(); reader.close() }
+        let phases = PhaseLog()
+        reader.onNetworkPhaseChanged = { phases.add($0) }   // givo-19
         try reader.open()
 
         let slice = 256 * 1024
@@ -196,5 +198,16 @@ struct FaultedConnectionRefusalTests {
         #expect(!OriginRequestBudget.shared.isPaced(url), "and no request-rate pacer armed")
         // Upper bound only: other suites scale the reconnect backoff process-wide while this runs.
         #expect(elapsed < 12, "1 + 2 + 4 s of retries, not the ladder (took \(elapsed)s)")
+        // givo-19: the host hears the source is down while the retries run, and up again after.
+        let seen = phases.snapshot()
+        #expect(seen.contains(.reconnecting), "no .reconnecting while the origin refused: \(seen)")
+        #expect(seen.last == .flowing, "the delivery after the retries reads as flowing: \(seen)")
+    }
+
+    private final class PhaseLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [ReaderNetworkPhase] = []
+        func add(_ phase: ReaderNetworkPhase) { lock.lock(); items.append(phase); lock.unlock() }
+        func snapshot() -> [ReaderNetworkPhase] { lock.lock(); defer { lock.unlock() }; return items }
     }
 }

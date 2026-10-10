@@ -3749,6 +3749,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             OriginRequestBudget.shared.noteRefusalWitnessed(for: respondedBy ?? requestURL())
             let delayText = String(format: "%.1f", selfCaused.delay)
             if let n = selfCaused.faultRetry {
+                // givo-19: after the ORIGIN ended our connection the retries can run 15 s, so the host is
+                // told the source is down at the first refusal. A retry after our own close (givo-1) is
+                // one second and stays silent. The next delivery emits `.flowing`.
+                emitNetworkPhase(.reconnecting)
                 EngineLog.emit(
                     "[AVIOReader] \(label) gen=\(generation) status=\(status) \(Int(selfCaused.since * 1000))ms after "
                     + "the origin ended our last connection: it still counts it; retry \(n) of "

@@ -4299,6 +4299,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // of seeking the demuxer that just failed.
             if !isLiveSession, sideAudioDemuxer == nil, let fresh = registerRestartReopenDemuxer(epoch: epoch) {
                 let reopenStart = DispatchTime.now()
+                // givo-19: an origin that allows one request counts the old reader's retry ladder as the
+                // request in flight, so the fresh reader would be refused for as long as the two take
+                // turns. There the old one is closed BEFORE the fresh one dials; a failed reopen then
+                // fails the session rather than leave two readers on one slot.
+                let oneRequestOrigin = OriginRequestBudget.shared.requiresSerialRequests(sourceURL)
+                if oneRequestOrigin {
+                    dem.markClosed()
+                    EngineLog.emit(
+                        "[HLSVideoEngine] restart at idx=\(idx): one-request origin; closed the old reader's "
+                        + "retry ladder before the fresh reader dials (givo-19)",
+                        category: .session)
+                }
                 do {
                     // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
                     // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must

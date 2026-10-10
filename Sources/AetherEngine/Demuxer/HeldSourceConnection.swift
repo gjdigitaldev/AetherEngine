@@ -111,6 +111,12 @@ final class HeldSourceConnection: @unchecked Sendable {
     /// givo-1: the origin's response was accepted, so the end of this connection is the end of one
     /// the origin was serving.
     private var responseAccepted = false
+    /// givo-19: what the origin-close line reports, so a field log can tell a byte or time cap from a
+    /// connection the origin dropped while we had stopped reading it. Run-loop thread only.
+    private var bodyStartedAt: Date?
+    private var bodyBytes: Int64 = 0
+    private var lastDataAt: Date?
+    private var lastParkSeconds: Double = 0
 
     init(url: URL,
          offset: Int64,
@@ -238,6 +244,7 @@ final class HeldSourceConnection: @unchecked Sendable {
                 return
             }
             stateLock.lock(); responseAccepted = true; stateLock.unlock()   // givo-1
+            bodyStartedAt = Date()   // givo-19
             try pump(framing: Self.framing(for: head))
             return
         }
@@ -285,13 +292,19 @@ final class HeldSourceConnection: @unchecked Sendable {
         while true {
             if isCancelled { return }
             guard let delegate else { return }
+            let askedAt = Date()   // givo-19
             let budget = delegate.heldConnectionPullBudget(self)
+            lastParkSeconds = Date().timeIntervalSince(askedAt)   // givo-19: how long the reader held the read back
             if budget <= 0 { return }
             if isCancelled { return }
 
             let wire = try nextWireBytes(upTo: min(budget, Self.maxReadBytes), framing: &framing)
             guard let wire else { return }   // end of body
-            if !wire.isEmpty { delegate.heldConnection(self, didReceive: wire) }
+            if !wire.isEmpty {
+                bodyBytes += Int64(wire.count)   // givo-19
+                lastDataAt = Date()   // givo-19
+                delegate.heldConnection(self, didReceive: wire)
+            }
         }
     }
 
@@ -304,8 +317,18 @@ final class HeldSourceConnection: @unchecked Sendable {
             guard let data = try readBody(upTo: want) else {
                 // givo-11: the origin closed the socket mid-body. It ends like a clean end (the
                 // reader replaces it at the frontier), so this line is the only witness of who ended it.
-                EngineLog.emit("[HeldSourceConnection] gen=\(generation) the origin closed the connection with "
-                               + "\(remaining / 1024)KB of the body still due", category: .demux)
+                // givo-19: our own cancel ends the read the same way, and is not the origin's doing.
+                if !isCancelled {
+                    // givo-19: lifetime, bytes and the reader's last hold-back, to tell a cap from an idle drop.
+                    let now = Date()
+                    let lived = bodyStartedAt.map { now.timeIntervalSince($0) } ?? 0
+                    let sinceData = lastDataAt.map { now.timeIntervalSince($0) } ?? lived
+                    EngineLog.emit("[HeldSourceConnection] gen=\(generation) the origin closed the connection with "
+                                   + "\(remaining / 1024)KB of the body still due, after "
+                                   + String(format: "%.1f s and %.1f MB (last data %.1f s before; the reader had held its last read back %.1f s)",
+                                            lived, Double(bodyBytes) / 1_048_576, sinceData, lastParkSeconds),
+                                   category: .demux)
+                }
                 return nil
             }
             framing = .identity(remaining: remaining - Int64(data.count))

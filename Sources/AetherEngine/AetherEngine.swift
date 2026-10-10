@@ -360,6 +360,13 @@ public final class AetherEngine: ObservableObject {
         }.value
     }
 
+    /// givo-15: whether a seek on a sequential origin lands inside the produced, cached spans, with half a
+    /// second of what was read still ahead of it so the item has something to start on.
+    nonisolated static func sequentialSeekIsResident(target: Double, resident: [ClosedRange<Double>]) -> Bool {
+        guard target.isFinite, target >= 0 else { return false }
+        return resident.contains { target >= $0.lowerBound && target <= $0.upperBound - 0.5 }
+    }
+
     /// Rejection path: the seek never reached a host, so it gets a standalone event and no `.began`.
     func emitSeekRejected(_ reason: SeekEvent.Rejection, target: Double) {
         emitSeekEvent(id: nextSeekEventID(), origin: .programmatic, outcome: .rejected(reason), target: target)
@@ -5627,7 +5634,16 @@ public final class AetherEngine: ObservableObject {
                 return
             }
         }
-        if !isLive, loadedOptions.sequentialOrigin || isSourceSeekable == false {
+        // givo-15: a sequential origin cannot reopen past byte 0, but it keeps every segment it cut, so
+        // a target inside what the session already read lands from the cache on the native route.
+        let residentSequentialSeek = !isLive && loadedOptions.sequentialOrigin
+            && nativeHost != nil && softwareHost == nil && audioHost == nil
+            && Self.sequentialSeekIsResident(target: seconds, resident: residentRanges)
+        if residentSequentialSeek {
+            EngineLog.emit("[AetherEngine] seek(to:\(String(format: "%.2f", seconds))) on a sequential origin lands "
+                           + "inside what the session already read; served from the cache (givo-15)", category: .engine)
+        }
+        if !isLive, !residentSequentialSeek, loadedOptions.sequentialOrigin || isSourceSeekable == false {
             EngineLog.emit("[AetherEngine] seek(to:\(seconds)) rejected: source is forward-only", category: .engine)
             // A seek stashed during load must relinquish its optimistic clock as well.
             let wasDeferred = deferredSeekInFlight

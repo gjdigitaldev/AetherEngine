@@ -820,6 +820,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// opened, and flush fragments every `progressiveFragmentSeconds` so the loopback server has
     /// something to send while the segment is still being cut.
     private let servesSegmentsProgressively: Bool
+    /// givo-22: only this producer's first segment (`baseIndex`, a seek's landing) is progressive.
+    private let progressiveFirstSegment: Bool
     /// The fragment cadence inside a progressively delivered segment. Measured with `aetherctl play`
     /// on a Mac over a 6 Mbit/s origin (1080p HEVC at 2.7 Mbit/s, 3-9 s GOPs): playing after 1.9 s at
     /// 1 s fragments and 1.7 s at 0.5 s, against 2.3 s without progressive delivery. Each fragment
@@ -1495,10 +1497,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioMoovPrimeKnownUnobtainable: Bool = false,
         audioDelaySeconds: Double = 0,
         servesSegmentsProgressively: Bool = false,
+        progressiveFirstSegment: Bool = false,
         epoch: UInt64 = 0
     ) throws {
         self.epoch = epoch
         self.servesSegmentsProgressively = servesSegmentsProgressively
+        self.progressiveFirstSegment = progressiveFirstSegment   // givo-22
         self.audioDelaySeconds = audioDelaySeconds
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.audioMoovPrimeKnownUnobtainable = audioMoovPrimeKnownUnobtainable
@@ -2162,7 +2166,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // audio stream that decodes to nothing can't buffer the whole span and fill the disk (#64).
                 // Floored at 8s (the historical 2 x 4s value): a sub-second fastZap cut target (AE#195)
                 // must not shrink the cap below typical TS A/V interleave skew.
-                maxBufferedFragmentSeconds: servesProgressively
+                maxBufferedFragmentSeconds: servesProgressively(initialSegmentIndex)
                     ? Self.progressiveFragmentSeconds : max(8.0, 2 * targetSegmentDurationSeconds),
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
@@ -2630,15 +2634,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Progressive delivery is VOD only: live keeps its own window and blocking-reload contracts.
-    private var servesProgressively: Bool { !isLive && servesSegmentsProgressively }
+    /// givo-22: per segment, so a seek's landing segment can be progressive on its own.
+    private func servesProgressively(_ index: Int) -> Bool {
+        guard !isLive else { return false }
+        return servesSegmentsProgressively || (progressiveFirstSegment && index == baseIndex)
+    }
 
     private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {
-        guard servesProgressively else { return }
+        guard servesProgressively(index) else { return }
         cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
     }
 
     private func abandonSegmentInProgress(_ index: Int) {
-        guard servesProgressively, index != .min else { return }
+        guard index != .min, servesProgressively(index) else { return }
         cache.abandonInProgress(index: index)
     }
 

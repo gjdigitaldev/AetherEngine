@@ -870,6 +870,7 @@ extension AetherEngine {
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
+        session.servesLandingSegmentProgressively = loadedOptions.progressiveSegmentDeliveryAfterSeek   // givo-22
         session.firstSegmentTargetSeconds = loadedOptions.firstSegmentTargetSeconds   // givo-3
         session.segmentCacheMaxBytes = loadedOptions.segmentCacheMaxBytes   // givo-7
         // #240: the pump claims the source link through this gate while it is fetching, so the

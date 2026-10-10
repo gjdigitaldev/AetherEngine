@@ -821,6 +821,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// `nativeRemoteHLS` and on the software path, which serve no loopback segments.
     public var progressiveSegmentDelivery: Bool = false
 
+    /// givo-22: progressive delivery for the FIRST segment a seek's restart cuts, and only that one.
+    /// A seek's landing segment is one whole keyframe interval, which on a slow link (a portal's media
+    /// front at about the title's own bitrate) is many seconds of bytes AVPlayer would otherwise wait
+    /// for in full; served as it is cut, the picture comes at its first fragment. Opens and steady
+    /// play keep `progressiveSegmentDelivery`. Default false. VOD only, ignored where that is.
+    public var progressiveSegmentDeliveryAfterSeek: Bool = false
+
     /// givo-3: cut the first VOD loopback segment at the first keyframe at or after this many seconds
     /// instead of at the full cut target, so AVPlayer can start on a segment one GOP long. Only a
     /// keyframe-aligned plan is split, only where a keyframe falls inside the default first segment,

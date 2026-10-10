@@ -1680,6 +1680,22 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     private var fetchesProgressively: Bool { !isLive && servesSegmentsProgressively }
 
+    /// givo-22: the segment a seek's restart cuts first, fetched progressively on its own (nil = none).
+    private let landingLock = NSLock()
+    private var _progressiveLandingIndex: Int?
+
+    func setProgressiveLandingIndex(_ index: Int?) {
+        landingLock.lock(); _progressiveLandingIndex = index; landingLock.unlock()
+    }
+
+    /// givo-22: whether `index` is fetched progressively.
+    private func fetchesProgressively(_ index: Int) -> Bool {
+        if fetchesProgressively { return true }
+        guard !isLive else { return false }
+        landingLock.lock(); defer { landingLock.unlock() }
+        return _progressiveLandingIndex == index
+    }
+
     private func serveSource(at index: Int) -> SegmentSource? {
         guard index >= 0, index < currentSegmentCount else { return nil }
 
@@ -1746,7 +1762,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 // Only wait when the active producer can actually march into this index.
                 if activeProducerCovers(index),
                    let waited = cache.fetchSource(index: index, timeout: sparseHoleWaitSlice,
-                                                  progressive: fetchesProgressively) {
+                                                  progressive: fetchesProgressively(index)) {
                     return logServed(
                         index: index, source: waited, totalStart: totalStart, restarted: false)
                 }
@@ -1855,7 +1871,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     attempt += 1
                 }
                 if let source = cache.fetchSource(index: index, timeout: repositionWaitSlice,
-                                                  progressive: fetchesProgressively) {
+                                                  progressive: fetchesProgressively(index)) {
                     return logServed(index: index, source: source, totalStart: totalStart, restarted: true)
                 }
                 // Audit SEG-3: a closed cache answers fetch at once, so riding a restart that
@@ -1866,7 +1882,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
 
         let source = cache.fetchSource(index: index, timeout: forwardBackpressureWaitSeconds,
-                                       progressive: fetchesProgressively)
+                                       progressive: fetchesProgressively(index))
         if tookForwardWait, !needsRestart {
             if source == nil {
                 // Record the front as of the END of the burned wait: progress DURING the wait

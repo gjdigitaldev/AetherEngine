@@ -587,6 +587,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     )
     // givo-16: `AETHERCTL_CARRY_HEADERS=Cookie,X-User-Agent` keeps those of the --header set across a
     // cross-origin redirect (a set-top-box portal's redirector), the load option a host sets.
+    // givo-22: `AETHERCTL_PROGRESSIVE_AFTER_SEEK=1` serves a seek's landing segment as it is cut.
+    if ProcessInfo.processInfo.environment["AETHERCTL_PROGRESSIVE_AFTER_SEEK"] == "1" {
+        options.progressiveSegmentDeliveryAfterSeek = true
+    }
     if let carry = ProcessInfo.processInfo.environment["AETHERCTL_CARRY_HEADERS"] {
         options.carryIdentityHeadersAcrossRedirects = carry.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
     }

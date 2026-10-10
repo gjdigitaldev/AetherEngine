@@ -793,6 +793,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `LoadOptions.progressiveSegmentDelivery`, handed to the provider and to every producer this
     /// session builds. Set before `start()`.
     var servesSegmentsProgressively = false
+    /// givo-22: `LoadOptions.progressiveSegmentDeliveryAfterSeek`: a seek restart's first segment is
+    /// served as it is cut.
+    var servesLandingSegmentProgressively = false
 
     /// givo-3: `LoadOptions.firstSegmentTargetSeconds`, read by the VOD planner. Set before `start()`.
     var firstSegmentTargetSeconds: Double?
@@ -2806,7 +2809,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Allocate a new `HLSSegmentProducer` at the given segment index (initial bring-up and scrub restarts).
     func makeProducer(
         baseIndex: Int,
-        liveReopenOutputEndSeconds: Double? = nil
+        liveReopenOutputEndSeconds: Double? = nil,
+        landingSegmentProgressive: Bool = false   // givo-22
     ) throws -> HLSSegmentProducer {
         guard let dem = demuxer, let cache = cache, let cfg = savedVideoConfig else {
             throw HLSVideoEngineError.notStarted
@@ -2900,6 +2904,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // restart, live reopen, #99 revive) cuts with the offset currently in force.
             audioDelaySeconds: audioDelaySeconds,
             servesSegmentsProgressively: servesSegmentsProgressively,
+            progressiveFirstSegment: landingSegmentProgressive,   // givo-22
             epoch: producerEpoch
         )
         // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
@@ -4395,7 +4400,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             freshDemuxer.playIntentProvider = playIntentProvider   // and the pause bound its held connection is judged on (#377)
         }
         do {
-            let newProd = try makeProducer(baseIndex: idx)
+            // givo-22: the landing segment of a seek is served as it is cut.
+            let landingProgressive = servesLandingSegmentProgressively && !servesSegmentsProgressively && !isLiveSession
+            provider?.setProgressiveLandingIndex(landingProgressive ? idx : nil)
+            let newProd = try makeProducer(baseIndex: idx, landingSegmentProgressive: landingProgressive)
             producer = newProd
             anchorShiftLock.lock()
             recutMark = recutMark?.installing(producerEpoch: newProd.epoch, at: idx)

@@ -861,6 +861,19 @@ public struct LoadOptions: Sendable, Equatable {
     /// other session. Names the session: a correction that changes it is refused.
     public var carryIdentityHeadersAcrossRedirects: [String] = []
 
+    /// givo-20: asked for a fresh address when the origin ended this load's connection and then
+    /// refused the reconnect with a slot status (509 / 458 / 460) after the first quick retry. The
+    /// session continues at the same byte offset on the new address; at most three times in two
+    /// minutes, after which the refusal stands and the read fails. nil (the default) never asks.
+    /// Names the session: a correction that changes it is refused.
+    public var sourceURLRefresher: SourceURLRefresher? = nil
+
+    /// givo-20: seconds the readers of this origin wait after one of our own connections to it ended
+    /// before they dial again, for an origin that counts a closed connection that long (a portal's
+    /// media front measured ~2.2 s). nil (the default) dials once our side has closed. Names the
+    /// session: a correction that changes it is refused.
+    public var ownCloseReleaseSeconds: Double? = nil
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on

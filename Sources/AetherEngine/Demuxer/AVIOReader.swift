@@ -217,8 +217,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private func requestURL() -> URL {
         resolvedURLLock.lock()
-        defer { resolvedURLLock.unlock() }
-        return _resolvedURL ?? url
+        let pinned = _resolvedURL
+        resolvedURLLock.unlock()
+        return pinned ?? sourceURL()
+    }
+
+    /// givo-20: the address this source reads from now: the one the host refreshed it to, else the
+    /// one the load named. `url` stays the source's identity (books, caches, the refresh registry).
+    private func sourceURL() -> URL {
+        SourceURLRefresh.shared.current(for: url) ?? url
     }
 
     /// #392: when bytes for this source last came off the NETWORK, across generations. Wall clock
@@ -483,6 +490,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             faultedRetriesUsed += 1
             faultRetry = faultedRetriesUsed
             sinceEnd = Date().timeIntervalSince(faultedAt)
+            // givo-20: the first retry was refused too; a host that can mint a fresh address is asked now.
+            if faultedRetriesUsed >= 2, !sourceRefreshExhausted, SourceURLRefresh.shared.canRefresh(url) {
+                sourceRefreshDue = true
+            }
         } else {
             guard let since, since <= Self.selfCausedRefusalWindowSeconds, !selfCausedRetrySpent else { return nil }
             delay = Self.selfCausedRetryDelaySeconds * backoffScale
@@ -495,6 +506,51 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         nextFaultedRefillAt = selfCausedRetryAt
         return (sinceEnd, delay, faultRetry)
     }
+
+    /// givo-20: consume a due refresh. winCond is taken here.
+    private func takeSourceRefreshDue() -> Bool {
+        winCond.lock(); defer { winCond.unlock() }
+        let due = sourceRefreshDue
+        sourceRefreshDue = false
+        return due
+    }
+
+    private func refreshGuardTripped() -> Bool {
+        winCond.lock(); defer { winCond.unlock() }
+        return sourceRefreshExhausted
+    }
+
+    /// givo-20: ask the host for a fresh address and, given one, read on from it: the pin (the old
+    /// address's post-redirect target) goes, the lineage gets its retries back, and the next dial goes
+    /// out at once. Blocks the read thread while the host mints (its cooldown included).
+    private func refreshSourceAddress() -> SourceURLRefresh.Outcome {
+        EngineLog.emit("[AVIOReader] \(label) the origin ended our connection and refuses the reconnect; "
+                       + "asking the host for a fresh source address (givo-20)", category: .demux)
+        let outcome = SourceURLRefresh.shared.refresh(
+            source: url, timeout: Self.sourceRefreshTimeoutSeconds,
+            shouldAbort: { [weak self] in self?.isClosed ?? true })
+        switch outcome {
+        case .refreshed:
+            invalidateResolvedURL(reason: "a fresh source address from the host")
+            winCond.lock()
+            faultedLineageAt = Date()
+            faultedRetriesUsed = 0
+            selfCausedRetryAt = .distantPast
+            nextFaultedRefillAt = .distantPast
+            winCond.unlock()
+            EngineLog.emit("[AVIOReader] \(label) fresh source address; reading on at the frontier (givo-20)",
+                           category: .demux)
+        case .exhausted:
+            winCond.lock(); sourceRefreshExhausted = true; winCond.unlock()
+        case .unavailable:
+            EngineLog.emit("[AVIOReader] \(label) no fresh source address from the host; the retries go on (givo-20)",
+                           category: .demux)
+        }
+        return outcome
+    }
+
+    /// givo-20: how long a reader waits for the host's fresh address (a portal's cooldown and mint).
+    static let sourceRefreshTimeoutSeconds: TimeInterval = 20
 
     /// givo-1: sleep until `date` in short slices, so a close is honoured promptly.
     private func sleepUntilSelfCausedRetry(_ date: Date) {
@@ -1020,6 +1076,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// `faultedRetryDelaysSeconds`), and how many of its retries are spent. winCond-guarded.
     private var faultedLineageAt: Date?
     private var faultedRetriesUsed = 0
+    /// givo-20: the lineage's first retry was refused too: ask the host for a fresh address before the
+    /// next dial. winCond-guarded.
+    private var sourceRefreshDue = false
+    /// givo-20: the refresh guard tripped: the next empty-window refusal fails the read. winCond-guarded.
+    private var sourceRefreshExhausted = false
     /// givo-6: token bucket for a paced held connection (bytes), refilled at the origin's pace,
     /// holding at most one second of it. winCond-guarded.
     private var heldPaceTokens: Double = 0
@@ -2507,6 +2568,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 winCond.broadcast()
                 winCond.unlock()
                 if let refillFrom {
+                    if refillSelfCaused, takeSourceRefreshDue() {   // givo-20: refresh before the next dial
+                        _ = refreshSourceAddress()
+                    }
                     if !refillFaulted || refillSelfCaused
                         || chargeFaultedRunwayRefill(at: refillFrom, ahead: undrained,
                                                      status: refillStatus,
@@ -2525,6 +2589,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let retryAfter = connRetryAfter
             let selfCausedRefusal = connSelfCausedRefusal   // givo-1
             let selfCausedRetryAt = self.selfCausedRetryAt   // givo-1
+            let sourceRefreshExhaustedFails = sourceRefreshExhausted   // givo-20
 
             if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
                 winCond.unlock()
@@ -2610,6 +2675,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // its second to let go, charged to no streak and no pin rung; a refusal of the retry
             // takes the ladder below.
             if selfCausedRefusal {
+                // givo-20: a fresh address from the host, before the next dial on the refused one.
+                if takeSourceRefreshDue() {
+                    switch refreshSourceAddress() {
+                    case .refreshed:
+                        timedReconnect(seek: false, at: frontier)
+                        continue
+                    case .exhausted, .unavailable:
+                        break
+                    }
+                }
+                if sourceRefreshExhaustedFails || refreshGuardTripped() {
+                    EngineLog.emit("[AVIOReader] \(label) the origin still refuses (status=\(status)) and the host's fresh "
+                                   + "addresses are spent; failing the read (givo-20)", category: .demux)
+                    emitNetworkPhase(.exhausted)
+                    return totalRead > 0 ? Int32(totalRead) : -1
+                }
                 let backoffStart = DispatchTime.now()
                 sleepUntilSelfCausedRetry(selfCausedRetryAt)
                 diag.recordBackoff(ms: msSince(backoffStart))
@@ -3363,6 +3444,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
             if isClosed { return }
         }
+        // givo-20: an origin that keeps counting our closed connection for seconds gets them before the
+        // next dial (`LoadOptions.ownCloseReleaseSeconds`); refused for our own connection otherwise.
+        let release = OriginRequestBudget.shared.ownCloseReleaseRemaining(for: requestURL())
+        if release > 0.05 {
+            EngineLog.emit("[AVIOReader] \(label) gen=\(generation) waiting \(String(format: "%.1f", release))s for the "
+                           + "origin to release our last connection before dialing (givo-20)", category: .demux)
+            sleepUntilSelfCausedRetry(Date().addingTimeInterval(release))
+            if isClosed { return }
+        }
 
         var request = URLRequest(url: requestURL())
         // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
@@ -3951,7 +4041,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     private func streamDownloadSync() {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: sourceURL())   // givo-20
         request.timeoutInterval = 0  // No timeout for live streams
         applyExtraHeaders(&request)
 
@@ -4454,7 +4544,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the #126 last-resort probe for origins that answer bytes=0- without a length but honor
     /// real ranges.
     private func rangeProbeFileSize(range: String) -> Int64? {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: sourceURL())   // givo-20
         request.setValue(range, forHTTPHeaderField: "Range")
         request.timeoutInterval = 20
         applyExtraHeaders(&request)
@@ -4507,7 +4597,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// HEAD probe fallback for live-transcode endpoints that reject Range.
     private func headProbeFileSize() -> Int64 {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: sourceURL())   // givo-20
         request.httpMethod = "HEAD"
         request.timeoutInterval = 5
         applyExtraHeaders(&request)

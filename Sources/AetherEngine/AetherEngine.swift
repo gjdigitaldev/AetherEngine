@@ -364,6 +364,21 @@ public final class AetherEngine: ObservableObject {
     private static let carriedSourceKey = NSLock()
     nonisolated(unsafe) private static var carriedSources: [ObjectIdentifier: URL] = [:]
 
+    /// givo-20: the source this engine registered a refresher for.
+    nonisolated(unsafe) private static var refresherSources: [ObjectIdentifier: URL] = [:]
+
+    /// givo-20: one registration per engine, like the carried headers.
+    func registerSourceURLRefresher(_ refresher: SourceURLRefresher?, source: URL?) {
+        let id = ObjectIdentifier(self)
+        Self.carriedSourceKey.lock()
+        let previous = Self.refresherSources.removeValue(forKey: id)
+        if let source, refresher != nil { Self.refresherSources[id] = source }
+        Self.carriedSourceKey.unlock()
+        if let previous { SourceURLRefresh.shared.register(nil, for: previous) }
+        guard let source, let refresher else { return }
+        SourceURLRefresh.shared.register(refresher, for: source)
+    }
+
     /// givo-16: one registration per engine: the previous load's goes, this load's (if any) comes.
     func registerCarriedIdentityHeaders(_ names: [String], source: URL?) {
         let id = ObjectIdentifier(self)
@@ -4155,6 +4170,8 @@ public final class AetherEngine: ObservableObject {
             OriginRequestBudget.shared.setHostLimit(options.maxConcurrentSourceRequests, for: url)
             // givo-6: nil clears a pace an earlier load of this origin set.
             OriginRequestBudget.shared.setHeldPace(bitsPerSecond: options.heldSourceMaxBitsPerSecond, for: url)
+            // givo-20: nil clears a release an earlier load of this origin set.
+            OriginRequestBudget.shared.setOwnCloseRelease(seconds: options.ownCloseReleaseSeconds, for: url)
         } else if let ingest = customReader as? HLSLiveIngestReader {
             // AE#678: the ingest fetches from the playlist's origin, not from `aether-custom://`.
             OriginRequestBudget.shared.setHostLimit(
@@ -4272,6 +4289,7 @@ public final class AetherEngine: ObservableObject {
         // givo-16: this load's identity headers survive a cross-origin redirect (the previous load's
         // registration is replaced, so it cannot reach this source).
         registerCarriedIdentityHeaders(options.carryIdentityHeadersAcrossRedirects, source: url)
+        registerSourceURLRefresher(options.sourceURLRefresher, source: url)   // givo-20
         // givo-8: the previous session's source request closed in the teardown above; an origin that
         // keeps counting a closed connection for a moment gets that moment before this load dials.
         if let delay = options.sourceDialDelaySeconds, delay > 0, delay.isFinite {
@@ -6432,6 +6450,7 @@ public final class AetherEngine: ObservableObject {
 
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         registerCarriedIdentityHeaders([], source: nil)   // givo-16
+        registerSourceURLRefresher(nil, source: nil)   // givo-20
         closedSourceKeptNativeItem = false   // givo-18
         cancelPendingAudioSelection()
         releaseHeldPicture(reason: "stop")

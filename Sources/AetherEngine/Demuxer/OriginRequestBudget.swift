@@ -121,6 +121,8 @@ final class OriginRequestBudget: @unchecked Sendable {
         var lastOwnCloseAt: DispatchTime?
         /// givo-6: `LoadOptions.heldSourceMaxBitsPerSecond`, in bytes per second; nil = unpaced.
         var heldPaceBytesPerSecond: Double?
+        /// givo-20: `LoadOptions.ownCloseReleaseSeconds`; nil = no wait after our own close.
+        var ownCloseReleaseSeconds: Double?
         var refusals = 0
         var lastRefusalAt: DispatchTime?
         /// nil `quietUntil` means the request-rate pacer is inert. The bucket remains untouched
@@ -684,6 +686,25 @@ final class OriginRequestBudget: @unchecked Sendable {
         var state = origins[key] ?? OriginState()
         state.heldPaceBytesPerSecond = bitsPerSecond.flatMap { $0 > 0 ? Double($0) / 8 : nil }
         origins[key] = state
+    }
+
+    /// givo-20: how long this origin keeps counting a connection of ours after it ended, set per load.
+    func setOwnCloseRelease(seconds: Double?, for url: URL) {
+        guard let raw = Self.originKey(for: url) else { return }
+        lock.lock(); defer { lock.unlock() }
+        let key = headLocked(raw)
+        var state = origins[key] ?? OriginState()
+        state.ownCloseReleaseSeconds = seconds.flatMap { $0 > 0 && $0.isFinite ? min($0, 10) : nil }
+        origins[key] = state
+    }
+
+    /// givo-20: seconds still to wait before dialing this origin again, 0 when none.
+    func ownCloseReleaseRemaining(for url: URL) -> Double {
+        guard let raw = Self.originKey(for: url) else { return 0 }
+        lock.lock(); defer { lock.unlock() }
+        guard let state = origins[headLocked(raw)], let release = state.ownCloseReleaseSeconds,
+              let closed = state.lastOwnCloseAt else { return 0 }
+        return max(0, release - Self.elapsedSeconds(from: closed, to: now()))
     }
 
     func heldPaceBytesPerSecond(for url: URL) -> Double? {

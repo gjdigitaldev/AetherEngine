@@ -277,6 +277,8 @@ enum SessionOptionCorrection {
         "heldSourceConnection",
         "sharedOutputRole",
         "carryIdentityHeadersAcrossRedirects",
+        "sourceURLRefresher",
+        "ownCloseReleaseSeconds",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -320,6 +322,9 @@ enum SessionOptionCorrection {
         if proposed.carryIdentityHeadersAcrossRedirects != current.carryIdentityHeadersAcrossRedirects {
             refused.append("carryIdentityHeadersAcrossRedirects")
         }
+        // givo-20: both are registered when the load opened the source.
+        if proposed.sourceURLRefresher != current.sourceURLRefresher { refused.append("sourceURLRefresher") }
+        if proposed.ownCloseReleaseSeconds != current.ownCloseReleaseSeconds { refused.append("ownCloseReleaseSeconds") }
         return refused
     }
 
@@ -405,7 +410,7 @@ enum SessionOptionCorrection {
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "firstSegmentTargetSeconds", "heldSourceMaxBitsPerSecond", "segmentCacheMaxBytes", "sourceDialDelaySeconds", "carryIdentityHeadersAcrossRedirects", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "firstSegmentTargetSeconds", "heldSourceMaxBitsPerSecond", "segmentCacheMaxBytes", "sourceDialDelaySeconds", "carryIdentityHeadersAcrossRedirects", "sourceURLRefresher", "ownCloseReleaseSeconds", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]

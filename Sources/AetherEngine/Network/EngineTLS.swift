@@ -20,10 +20,22 @@ public enum EngineTLS {
     /// real one can answer for each rather than relaxing both. A host that
     /// wants to pin an SPKI hash reads the protection space and decides.
     ///
-    /// Read per challenge, so replacing it applies from the next connection
-    /// without rebuilding sessions. Called off the main actor, from whichever
-    /// queue the session raised the challenge on, so it has to be
-    /// thread-safe. Lock-guarded like `EngineLog.handler`.
+    /// Read per challenge, but a challenge is not raised for every connection:
+    /// within one URL session, once a certificate was accepted
+    /// (`.useCredential`), later connections to that origin, full handshakes
+    /// included, are served even where this now answers false (a system-default
+    /// answer, or a rejected protection space); only a cancelled challenge
+    /// refuses them (measured in the TLS lab, givo-35). Withdrawing an accept therefore takes
+    /// effect only in URL sessions that have not accepted that origin yet: the
+    /// next load's, or the next `ServerTrustPolicy`'s, which runs in sessions of
+    /// its own. Called off the main actor, from whichever queue the session
+    /// raised the challenge on, so it has to be thread-safe. Lock-guarded like
+    /// `EngineLog.handler`.
+    ///
+    /// TODO(R2570): after 4023, answer a system-default decision with an explicit
+    /// `SecTrustEvaluateWithError` (cancel when it fails) so a withdrawn accept
+    /// also refuses inside a session that accepted, with the lab test that shows
+    /// it.
     public static var serverTrustEvaluator: (@Sendable (URLProtectionSpace) -> Bool)? {
         get { lock.lock(); defer { lock.unlock() }; return _evaluator }
         set { lock.lock(); _evaluator = newValue; lock.unlock() }
@@ -341,8 +353,12 @@ public final class ServerTrustPolicy: @unchecked Sendable, Equatable {
     ///   - decide: asked per server-trust challenge of a connection this policy's load opens:
     ///     `.accept` trusts the certificate, `.reject` refuses it even where system trust would accept
     ///     it (the open fails as a certificate rejection), `.systemDefault` is the system's handling.
-    ///     The process-wide hooks are not asked. Called off the main actor, so it has to be
-    ///     thread-safe.
+    ///     The process-wide hooks are not asked. An answer is not re-asked for every connection: in a
+    ///     URL session that already accepted an origin, a later `.systemDefault` for it is still
+    ///     served (only `.reject` refuses there), so an accept the closure withdraws holds for this
+    ///     policy's sessions until the policy goes; a new load's policy starts clean. TODO(R2570):
+    ///     after 4023, `.systemDefault` gets an explicit trust evaluation. Called off the main actor,
+    ///     so it has to be thread-safe.
     ///   - onRedirect: told (the request's original URL, the next hop) for every redirect a request
     ///     made under this policy is about to follow, before the hop is requested, so `decide` can
     ///     answer for the hosts this load's source redirects to and for no other load's. Same

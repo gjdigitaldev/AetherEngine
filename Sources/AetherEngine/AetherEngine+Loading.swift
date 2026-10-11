@@ -954,8 +954,11 @@ extension AetherEngine {
         session.onFirstHDR10PlusDetected = { [weak self] in
             self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusDetected() }
         }
-        session.onPlaylistShiftChanged = { [weak self] seconds, seamItemSeconds in
-            self?.hop(for: generation) { [weak self] in
+        // givo-35: the session owns this closure, so it holds the session weakly. A strong capture (the
+        // placement check below names it) made a cycle that kept every stopped VOD session, its open
+        // profile and the load's trust policy with its URL sessions alive for the rest of the process.
+        session.onPlaylistShiftChanged = { [weak self, weak session] seconds, seamItemSeconds in
+            self?.hop(for: generation) { [weak self, weak session] in
                 guard let self = self else { return }
                 let prevShift = self.playlistShiftSeconds
                 let delta = seconds - prevShift
@@ -1019,7 +1022,7 @@ extension AetherEngine {
                 // timeline was carrying the last axis this side published; the item's own loaded
                 // ranges say whether it was. Live rebases the whole timeline at a program boundary
                 // and nothing older comes back on screen, so it composes nothing and checks nothing.
-                if !self.isLive {
+                if !self.isLive, let session {
                     self.verifyPlacementAgainstLoadedRanges(session: session)
                 }
             }

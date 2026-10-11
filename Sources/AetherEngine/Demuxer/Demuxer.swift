@@ -261,6 +261,9 @@ public final class Demuxer: @unchecked Sendable {
     /// load a retained snapshot instead of a race.
     private let providerLock = NSLock()
     private var _avioProvider: AVIOProvider?
+    /// givo-35: the network reader this demuxer opened, for the lifetime witness test.
+    var networkReaderForTesting: AVIOReader? { avioProvider as? AVIOReader }
+
     private var avioProvider: AVIOProvider? {
         get {
             providerLock.lock()

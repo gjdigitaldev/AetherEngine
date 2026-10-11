@@ -107,35 +107,57 @@ struct VODOpenSeekIntegrationTests {
         print("VOD_SEQUENTIAL clock=\(engine.currentTime) seekable=\(engine.canSeek) events=\(events)")
     }
 
-    /// givo-34: a load's trust policy (and the URL sessions it owns) goes with the load that stopped,
-    /// and stays through the session's own rebuilds of the same title.
-    @Test("A stop releases the load's trust policy; a rebuild of the same title keeps it",
+    /// givo-34 / givo-35: a stopped load lets go of everything it opened: the HLS session, its reader
+    /// and the load's trust policy with the URL sessions it owns. Until givo-35 the session's playlist-
+    /// shift callback held the session strongly (a cycle), so every stopped VOD session lived on with its
+    /// open profile and policy for the rest of the process. A rebuild of the same title keeps them.
+    @Test("A stop releases the session, its reader and the load's trust policy within seconds; a rebuild keeps them",
           .enabled(if: ProcessInfo.processInfo.environment["AETHER_VOD_FIXTURE"] != nil))
-    func stopReleasesTrustPolicy() async throws {
+    func stopReleasesSessionReaderAndPolicy() async throws {
         let origin = try ProbeHTTPTestOrigin(data: fixture())
-        let engine = try AetherEngine()
-        defer { engine.stop(); origin.stop() }
-        weak var released: ServerTrustPolicy?
-        do {
-            var options = LoadOptions()
-            options.suppressDisplayCriteria = true
-            options.serverTrust = ServerTrustPolicy(decide: { _ in .systemDefault })
-            released = options.serverTrust
-            try await engine.load(url: URL(string: "http://127.0.0.1:\(origin.port)/media.mkv")!, options: options)
+        defer { origin.stop() }
+        let witness = LoadLifetimeWitness()
+        let port = origin.port
+        // Its own task, so no frame of this test holds a temporary of the engine's.
+        try await Task { @MainActor in try await Self.loadRebuildAndStop(port: port, witness: witness) }.value
+        let started = ContinuousClock.now
+        let released = try await waitFor(upTo: .seconds(5)) {
+            witness.session == nil && witness.reader == nil && witness.policy == nil && witness.engine == nil
         }
-        let ready = try await waitFor(upTo: .seconds(10)) { engine.isSessionReady }
+        print("LIFETIME released=\(released) after \(ContinuousClock.now - started) session=\(witness.session != nil) reader=\(witness.reader != nil) policy=\(witness.policy != nil)")
+        #expect(witness.session == nil, "the stopped HLS session is still alive")
+        #expect(witness.reader == nil, "the stopped session's reader is still alive")
+        #expect(witness.policy == nil, "the stopped load's trust policy is still alive")
+    }
+
+    @MainActor
+    private static func loadRebuildAndStop(port: UInt16, witness: LoadLifetimeWitness) async throws {
+        let engine = try AetherEngine()
+        witness.engine = engine
+        var options = LoadOptions()
+        options.suppressDisplayCriteria = true
+        options.serverTrust = ServerTrustPolicy(decide: { _ in .systemDefault })
+        witness.policy = options.serverTrust
+        try await engine.load(url: URL(string: "http://127.0.0.1:\(port)/media.mkv")!, options: options)
+        let ready = try await waitFor(upTo: .seconds(10)) { engine.isSessionReady && engine.currentTime > 0.3 }
         try #require(ready)
-        #expect(released != nil, "a playing load lost its policy")
         try await engine.reloadAtCurrentPosition()
-        #expect(released != nil, "a rebuild of the same title dropped its policy")
-        #expect(engine.loadedOptions.serverTrust != nil)
+        let rebuilt = try await waitFor(upTo: .seconds(10)) { engine.isSessionReady }
+        try #require(rebuilt)
+        #expect(witness.policy != nil, "a rebuild of the same title dropped the load's policy")
+        #expect(engine.loadedOptions.serverTrust === witness.policy)
+        witness.session = engine.nativeVideoSession
+        witness.reader = engine.nativeVideoSession?.demuxer?.networkReaderForTesting
+        #expect(witness.session?.openProfile.serverTrust === witness.policy, "the rebuilt session does not ask the load's policy")
         engine.stop()
         #expect(engine.loadedOptions.serverTrust == nil, "a stopped session still names its load's policy")
-        // Measured with this test: the stopped HLS session itself is still alive 40 s after stop, and its
-        // open profile names the policy, so the policy outlives the engine's own reference.
-        let gone = try await waitFor(upTo: .seconds(5)) { released == nil }
-        withKnownIssue("the stopped HLS session is not released yet and still holds the policy") {
-            #expect(gone, "the stopped load's policy is still alive")
-        }
     }
+}
+
+/// givo-35: weak references to what one load opened.
+final class LoadLifetimeWitness: @unchecked Sendable {
+    weak var engine: AetherEngine?
+    weak var session: HLSVideoEngine?
+    weak var reader: AVIOReader?
+    weak var policy: ServerTrustPolicy?
 }

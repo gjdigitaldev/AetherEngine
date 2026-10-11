@@ -28,7 +28,8 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
     private let keyCacheLock = NSLock()
     private var keyCache: [String: Data] = [:]
 
-    init(session: URLSession? = nil, httpHeaders: [String: String] = [:], credentialOrigin: URL? = nil) {
+    init(session: URLSession? = nil, httpHeaders: [String: String] = [:], credentialOrigin: URL? = nil,
+         serverTrust: ServerTrustPolicy? = nil) {
         if let session {
             self.session = session
         } else {
@@ -36,7 +37,7 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
             cfg.timeoutIntervalForRequest = 10
             cfg.timeoutIntervalForResource = 30
             self.session = URLSession(
-                configuration: cfg, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+                configuration: cfg, delegate: EngineTLS.sessionDelegate(for: serverTrust), delegateQueue: nil)   // givo-31
         }
         credentials = CredentialScope(headers: httpHeaders, anchor: credentialOrigin)
     }

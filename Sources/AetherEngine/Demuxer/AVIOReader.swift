@@ -1314,11 +1314,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Only static controlled probes use this; playback retains its existing transport policy.
     private let probeControl: ProbeControl?
     private let probeRequestSession: URLSession?
+    /// givo-31: the load's `LoadOptions.serverTrust`. Every connection this reader opens asks it (the
+    /// pump, the held connection, the detours, the probes, the tail prefetch, the streaming read,
+    /// reconnects and fresh addresses alike), in URL sessions of the policy's own; nil keeps the
+    /// shared sessions and the process-wide hooks.
+    let serverTrust: ServerTrustPolicy?
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init()) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), serverTrust: ServerTrustPolicy? = nil) {
         self.sourceOpenPolicy = sourceOpenPolicy
+        self.serverTrust = serverTrust   // givo-31
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
         self.url = url
@@ -3299,7 +3305,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         let delegate = TailPrefetchDelegate(
             expectedLength: Self.tailPrefetchBytes,
-            extraHeaders: headers(for: request.url)
+            extraHeaders: headers(for: request.url),
+            trust: serverTrust   // givo-31
         )
         // #281 retest: one line per open, and the line the field needs. The advertised way to check
         // this fix was "does a bytes=-65536 request show up", which the engine never printed, so a
@@ -3347,7 +3354,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     category: .demux)
             }
         }
-        let task = Self.chunkSession.dataTask(with: request)
+        let task = chunkURLSession.dataTask(with: request)   // givo-31
         task.delegate = delegate
         winCond.lock()
         tailPrefetchTask = task
@@ -3642,6 +3649,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 generation: generation,
                 ticket: ticket,
                 addressNote: connectionAddressNote,   // givo-23
+                serverTrust: serverTrust,   // givo-31
                 delegate: self
             )
         } else {
@@ -3650,9 +3658,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 generation: generation,
                 extraHeaders: headers(for: request.url),
                 ticket: ticket,
-                originURL: requestURLForBudget
+                originURL: requestURLForBudget,
+                trust: serverTrust   // givo-31
             )
-            let task = Self.persistentSession.dataTask(with: request)
+            let task = persistentURLSession.dataTask(with: request)   // givo-31
             task.delegate = delegate
             transfer = task
         }
@@ -4223,6 +4232,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         let delegate = StreamingDelegate(
             extraHeaders: headers(for: request.url),
+            trust: serverTrust,   // givo-31
             onResponse: { [weak self] response in
                 // Advisory length for the EOF/EIO distinction; -1 (chunked / unknown) leaves the
                 // clean-end path as the only EOF source.
@@ -4450,11 +4460,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// handshakes, which Cloudflare-fronted origins can flag as suspicious. Distinct
     /// from syncRequest's per-request pattern (load-bearing for chunk-fetch leak control).
     private static let probeSession: URLSession = {
+        URLSession(configuration: probeSessionConfig(), delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+    }()
+
+    private static func probeSessionConfig() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
         config.urlCache = nil
         config.timeoutIntervalForRequest = 20
-        return URLSession(configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
-    }()
+        return config
+    }
+
+    /// givo-31: the probe, chunk and persistent sessions this reader's requests run in: the shared
+    /// ones, or under a load's trust policy the policy's own (same configuration), so a connection
+    /// one policy accepted is never pooled into another's request.
+    private var probeURLSession: URLSession {
+        serverTrust?.pooledSession("avio.probe", configuration: Self.probeSessionConfig) ?? Self.probeSession
+    }
+
+    private var chunkURLSession: URLSession {
+        serverTrust?.pooledSession("avio.chunk", configuration: { Self.makeSessionConfig() }) ?? Self.chunkSession
+    }
+
+    private var persistentURLSession: URLSession {
+        serverTrust?.pooledSession("avio.persistent", configuration: { Self.makeSessionConfig(longLived: true) })
+            ?? Self.persistentSession
+    }
 
     /// Audit DMX-5: where a 206 says its body starts, when that is not where it was asked to.
     /// Every ranged path here places the body at the REQUESTED offset, so a 206 aligned to an
@@ -4657,8 +4687,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { OriginRequestBudget.shared.release(ticket) }
         guard !scope.isStopped, !isClosed, remaining() > 0 else { return -1 }
         request.timeoutInterval = max(0.001, remaining())
-        let delegate = ProbeDelegate(extraHeaders: headers(for: request.url))
-        let task = Self.probeSession.dataTask(with: request)
+        let delegate = ProbeDelegate(extraHeaders: headers(for: request.url), trust: serverTrust)   // givo-31
+        let task = probeURLSession.dataTask(with: request)   // givo-31
         task.delegate = delegate
         let completion = DispatchSemaphore(value: 0)
         delegate.onCompletion = { completion.signal() }
@@ -4720,8 +4750,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         defer { OriginRequestBudget.shared.release(ticket) }
 
-        let delegate = ProbeDelegate(extraHeaders: headers(for: request.url))
-        let task = (probeRequestSession ?? Self.probeSession).dataTask(with: request)
+        let delegate = ProbeDelegate(extraHeaders: headers(for: request.url), trust: serverTrust)   // givo-31
+        let task = (probeRequestSession ?? probeURLSession).dataTask(with: request)   // givo-31
         task.delegate = delegate
 
         let semaphore = DispatchSemaphore(value: 0)
@@ -5017,8 +5047,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { OriginRequestBudget.shared.release(ticket) }
 
         let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
-                                          bodyLimit: Self.expectedBodyBytes(for: request))
-        let task = (probeRequestSession ?? Self.chunkSession).dataTask(with: request)
+                                          bodyLimit: Self.expectedBodyBytes(for: request),
+                                          trust: serverTrust)   // givo-31
+        let task = (probeRequestSession ?? chunkURLSession).dataTask(with: request)   // givo-31
         task.delegate = delegate
 
         let semaphore = DispatchSemaphore(value: 0)
@@ -5169,7 +5200,8 @@ final class DetourBlockCache: @unchecked Sendable {
 private func redirectPreservingHeaders(
     task: URLSessionTask,
     newRequest request: URLRequest,
-    extraHeaders: [String: String]
+    extraHeaders: [String: String],
+    trust: ServerTrustPolicy?   // givo-31: the hop is the reader's load's to learn
 ) -> URLRequest {
     // #388: this is the moment the request the reader budgeted for stops being answered by the
     // origin it was budgeted against. Every fetch the reader makes passes through here, so it is
@@ -5182,7 +5214,8 @@ private func redirectPreservingHeaders(
         request,
         originalURL: task.originalRequest?.url,
         originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
-        extraHeaders: extraHeaders)
+        extraHeaders: extraHeaders,
+        trust: trust)
 }
 
 // MARK: - Persistent Read Delegate
@@ -5400,13 +5433,17 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     /// connection the origin was serving.
     private var responseAccepted = false
 
+    /// givo-31: the reader's load's trust policy.
+    let trust: ServerTrustPolicy?
+
     init(reader: AVIOReader, generation: Int, extraHeaders: [String: String],
-         ticket: OriginRequestBudget.Ticket?, originURL: URL) {
+         ticket: OriginRequestBudget.Ticket?, originURL: URL, trust: ServerTrustPolicy?) {
         self.reader = reader
         self.generation = generation
         self.extraHeaders = extraHeaders
         self.ticket = ticket
         self.originURL = originURL
+        self.trust = trust
     }
 
     /// Backstop. A slot that is never returned would cap this origin one lower for the life of the
@@ -5431,7 +5468,7 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, trust: trust, completionHandler: completionHandler)   // givo-31
     }
 
     func urlSession(
@@ -5442,7 +5479,7 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         completionHandler(redirectPreservingHeaders(
-            task: task, newRequest: request, extraHeaders: extraHeaders))
+            task: task, newRequest: request, extraHeaders: extraHeaders, trust: trust))
     }
 
     func urlSession(
@@ -5534,9 +5571,13 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
 
-    init(extraHeaders: [String: String], bodyLimit: Int?) {
+    /// givo-31: the reader's load's trust policy.
+    let trust: ServerTrustPolicy?
+
+    init(extraHeaders: [String: String], bodyLimit: Int?, trust: ServerTrustPolicy?) {
         self.extraHeaders = extraHeaders
         self.bodyLimit = bodyLimit
+        self.trust = trust
     }
 
     func urlSession(
@@ -5545,7 +5586,7 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, trust: trust, completionHandler: completionHandler)   // givo-31
     }
 
     func urlSession(
@@ -5556,7 +5597,7 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         completionHandler(redirectPreservingHeaders(
-            task: task, newRequest: request, extraHeaders: extraHeaders))
+            task: task, newRequest: request, extraHeaders: extraHeaders, trust: trust))
     }
 
     func urlSession(
@@ -5643,15 +5684,19 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
     /// IPTV origins routinely 302 twice (portal -> panel -> archive host) and the final
     /// host must still see the caller's User-Agent / auth headers.
     let extraHeaders: [String: String]
+    /// givo-31: the reader's load's trust policy (this delegate is its streaming session's own).
+    let trust: ServerTrustPolicy?
 
     init(
         extraHeaders: [String: String] = [:],
+        trust: ServerTrustPolicy?,
         onResponse: (@Sendable (URLResponse) -> Void)? = nil,
         onRefused: (@Sendable (Int, URL?) -> Void)? = nil,
         onData: @escaping @Sendable (Data) -> Void,
         onComplete: @escaping @Sendable (Error?) -> Void
     ) {
         self.extraHeaders = extraHeaders
+        self.trust = trust
         self.onResponse = onResponse
         self.onRefused = onRefused
         self.onData = onData
@@ -5666,7 +5711,7 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         completionHandler(redirectPreservingHeaders(
-            task: task, newRequest: request, extraHeaders: extraHeaders))
+            task: task, newRequest: request, extraHeaders: extraHeaders, trust: trust))
     }
 
     func urlSession(
@@ -5675,7 +5720,7 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, trust: trust, completionHandler: completionHandler)   // givo-31
     }
 
     func urlSession(
@@ -5729,8 +5774,12 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
 
-    init(extraHeaders: [String: String]) {
+    /// givo-31: the reader's load's trust policy.
+    let trust: ServerTrustPolicy?
+
+    init(extraHeaders: [String: String], trust: ServerTrustPolicy?) {
         self.extraHeaders = extraHeaders
+        self.trust = trust
     }
 
     func urlSession(
@@ -5739,7 +5788,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, trust: trust, completionHandler: completionHandler)   // givo-31
     }
 
     func urlSession(
@@ -5750,7 +5799,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         completionHandler(redirectPreservingHeaders(
-            task: task, newRequest: request, extraHeaders: extraHeaders))
+            task: task, newRequest: request, extraHeaders: extraHeaders, trust: trust))
     }
 
     func urlSession(
@@ -5888,9 +5937,14 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
     /// silent failure would be a caller waiting out its whole budget for bytes that are never coming.
     var onOutcome: ((Outcome) -> Void)?
 
-    init(expectedLength: Int, extraHeaders: [String: String]) {
+    /// givo-31: the reader's load's trust policy (the challenge itself goes to the session's delegate,
+    /// which is the policy's own on a policy's session).
+    private let trust: ServerTrustPolicy?
+
+    init(expectedLength: Int, extraHeaders: [String: String], trust: ServerTrustPolicy?) {
         self.expectedLength = expectedLength
         self.extraHeaders = extraHeaders
+        self.trust = trust
     }
 
     func urlSession(
@@ -5903,7 +5957,7 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
         // Same policy as every other delegate here: credential headers do not follow a redirect
         // to another host (the #126 cross-origin token replay).
         completionHandler(redirectPreservingHeaders(
-            task: task, newRequest: request, extraHeaders: extraHeaders))
+            task: task, newRequest: request, extraHeaders: extraHeaders, trust: trust))
     }
 
     func urlSession(

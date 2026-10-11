@@ -63,6 +63,7 @@ extension AetherEngine {
         if isCustomSource, !Self.canForkCustomReader(customReader) { return }
 
         let headers = loadedOptions.httpHeaders
+        let trust = loadedOptions.serverTrust   // givo-31
         let formatHint = customFormatHint
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
@@ -70,7 +71,7 @@ extension AetherEngine {
             await self?.runAtmosConfirmation(
                 url: url, formatHint: formatHint, headers: headers,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                candidates: candidates)
+                candidates: candidates, serverTrust: trust)
         }
     }
 
@@ -98,7 +99,7 @@ extension AetherEngine {
     nonisolated private func runAtmosConfirmation(
         url: URL, formatHint: String?, headers: [String: String],
         callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
-        candidates: [Int32]
+        candidates: [Int32], serverTrust: ServerTrustPolicy?
     ) async {
         var confirmed: [Int32] = []
         for index in candidates {
@@ -106,7 +107,7 @@ extension AetherEngine {
             if await confirmAtmosForOneTrack(
                 url: url, formatHint: formatHint, headers: headers,
                 callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration,
-                targetIndex: index
+                targetIndex: index, serverTrust: serverTrust
             ) {
                 confirmed.append(index)
                 await MainActor.run { [weak self] in
@@ -128,7 +129,7 @@ extension AetherEngine {
     nonisolated private func confirmAtmosForOneTrack(
         url: URL, formatHint: String?, headers: [String: String],
         callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
-        targetIndex: Int32
+        targetIndex: Int32, serverTrust: ServerTrustPolicy?
     ) async -> Bool {
         // A fresh clone per pass: a demuxer owns its reader's cursor, so the passes cannot share one.
         let reader: IOReader? = await MainActor.run { [weak self] in
@@ -157,7 +158,8 @@ extension AetherEngine {
 
         guard AetherEngine.openAtmosConfirmationDemuxer(
             demuxer, url: url, reader: reader, formatHint: formatHint, headers: headers,
-            callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration
+            callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration,
+            serverTrust: serverTrust
         ) else { return false }
         guard !Task.isCancelled else { return false }
         return AetherEngine.detectAtmos(
@@ -171,10 +173,12 @@ extension AetherEngine {
     /// is a false, never a throw: a background enrichment must not surface an error the host did not ask for.
     nonisolated static func openAtmosConfirmationDemuxer(
         _ demuxer: Demuxer, url: URL, reader: IOReader?, formatHint: String?,
-        headers: [String: String], callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?
+        headers: [String: String], callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
+        serverTrust: ServerTrustPolicy? = nil
     ) -> Bool {
         let profile = DemuxerOpenProfile.atmosConfirmationDemuxer(
             callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
+            .withServerTrust(serverTrust)   // givo-31
         do {
             if let reader {
                 try demuxer.open(reader: reader, formatHint: formatHint, profile: profile)

@@ -24,14 +24,24 @@ enum HLSCarriageProbe {
     /// caller. The request timeout is short because a verdict that arrives after the watchdog grace has
     /// already been overtaken by the grace it was meant to replace.
     private static let sharedSession: URLSession = {
+        URLSession(
+            configuration: probeConfiguration(), delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+    }()
+
+    private static func probeConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
         // The request timeout is an idle timeout; without a resource ceiling an origin trickling a
         // byte every few seconds kept a probe open for the 7-day default (audit NET-10).
         configuration.timeoutIntervalForResource = 30
-        return URLSession(
-            configuration: configuration, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
-    }()
+        return configuration
+    }
+
+    /// givo-31: the probe session for a load: the shared one, or under the load's trust policy the
+    /// policy's own.
+    private static func probeSession(for trust: ServerTrustPolicy?) -> URLSession {
+        trust?.pooledSession("carriage-probe", configuration: probeConfiguration) ?? sharedSession
+    }
 
     /// AE#296: what the playlist chain established, and whether a media byte is still needed to settle it.
     /// The two stages are separated because they have different costs: playlists are free of a per-token
@@ -56,14 +66,15 @@ enum HLSCarriageProbe {
         playlistURL: URL,
         httpHeaders: [String: String],
         advertisesFragmentedMP4OnlyVideo: Bool,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) async -> PlaylistEvidence {
         do {
             return try await resolveFirstSegment(
                 playlistURL: playlistURL,
                 httpHeaders: httpHeaders,
                 advertisesFragmentedMP4OnlyVideo: advertisesFragmentedMP4OnlyVideo,
-                session: session ?? sharedSession
+                session: session ?? probeSession(for: serverTrust)   // givo-31
             )
         } catch {
             EngineLog.emit(
@@ -83,13 +94,14 @@ enum HLSCarriageProbe {
         url: URL,
         httpHeaders: [String: String],
         credentialOrigin: URL,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) async -> MPEGTransportStreamCodecProbe.Verdict {
         do {
             return try await classifySegmentHead(
                 url: url,
                 httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: credentialOrigin, sentTo: url),
-                session: session ?? sharedSession
+                session: session ?? probeSession(for: serverTrust)   // givo-31
             )
         } catch {
             EngineLog.emit(
@@ -105,19 +117,22 @@ enum HLSCarriageProbe {
         playlistURL: URL,
         httpHeaders: [String: String],
         advertisesFragmentedMP4OnlyVideo: Bool = false,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) async -> MPEGTransportStreamCodecProbe.Verdict {
         switch await classifyFromPlaylists(
             playlistURL: playlistURL,
             httpHeaders: httpHeaders,
             advertisesFragmentedMP4OnlyVideo: advertisesFragmentedMP4OnlyVideo,
-            session: session
+            session: session,
+            serverTrust: serverTrust
         ) {
         case .settled(let verdict):
             return verdict
         case .needsSegmentHead(let segmentURL):
             return await classifyDeferredSegmentHead(
-                url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: playlistURL, session: session
+                url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: playlistURL, session: session,
+                serverTrust: serverTrust
             )
         }
     }

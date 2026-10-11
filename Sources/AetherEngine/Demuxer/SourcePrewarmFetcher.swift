@@ -37,6 +37,12 @@ enum SourcePrewarmFetcher {
         delegate: EngineTLS.sessionDelegate,
         delegateQueue: nil)
 
+    /// givo-31: the session a warm runs in: the shared one, or under the warm's trust policy the
+    /// policy's own.
+    private static func session(for trust: ServerTrustPolicy?) -> URLSession {
+        trust?.pooledSession("prewarm", configuration: { AVIOReader.makeSessionConfig() }) ?? session
+    }
+
     /// One warm at a time, process-wide.
     ///
     /// The origin slot a warm takes is held for its whole body, not just for the round trip, so a
@@ -52,7 +58,9 @@ enum SourcePrewarmFetcher {
     static func warm(url: URL,
                      extraHeaders: [String: String],
                      byteBudget: Int,
+                     serverTrust: ServerTrustPolicy? = nil,
                      into store: SourcePrewarmStore = .shared) async -> SourcePrewarmReport {
+        let warmSession = Self.session(for: serverTrust)   // givo-31
         let budget = max(0, byteBudget)
         guard budget > 0 else { return decline(url, "byte budget is zero") }
         // The same early-out the tail prefetch takes: on an origin metered down to one request at a
@@ -67,7 +75,7 @@ enum SourcePrewarmFetcher {
         do {
             head = try await RangeFetch.run(url: url, extraHeaders: extraHeaders,
                                             requestedStart: 0, requestedLength: budget,
-                                            label: "prewarm head", session: session)
+                                            label: "prewarm head", session: warmSession)
         } catch let error as PrewarmDecline {
             return decline(url, error.reason)
         } catch {
@@ -90,14 +98,14 @@ enum SourcePrewarmFetcher {
             break
         case .suffix where head.total > Int64(head.body.count) + Int64(tailBytes):
             tail = await fetchTail(url: tailURL, extraHeaders: tailHeaders, source: url,
-                                   start: head.total - Int64(tailBytes), length: tailBytes)
+                                   start: head.total - Int64(tailBytes), length: tailBytes, session: warmSession)
         case .suffix:
             break
         case .range(let start):
             let length = Int(clamping: head.total - start)
             if length > 0 {
                 tail = await fetchTail(url: tailURL, extraHeaders: tailHeaders, source: url,
-                                       start: start, length: length)
+                                       start: start, length: length, session: warmSession)
             }
         }
         if Task.isCancelled { return decline(url, "cancelled") }
@@ -126,7 +134,8 @@ enum SourcePrewarmFetcher {
                                   extraHeaders: [String: String],
                                   source: URL,
                                   start: Int64,
-                                  length: Int) async -> ResidentSpan? {
+                                  length: Int,
+                                  session: URLSession) async -> ResidentSpan? {
         if let fetched = try? await RangeFetch.run(
             url: url, extraHeaders: extraHeaders,
             requestedStart: start, requestedLength: length,
@@ -275,18 +284,21 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
             OriginRequestBudget.shared.noteRedirect(from: from, to: to)
         }
         // Credential headers do not follow a redirect to another host (#126 cross-origin replay).
+        let route = EngineTLS.redirectRoute(of: session)   // givo-31: the warm's own policy learns the hop
         completionHandler(RedirectHeaderPolicy.redirectRequest(
             request,
             originalURL: task.originalRequest?.url,
             originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
-            extraHeaders: extraHeaders))
+            extraHeaders: extraHeaders,
+            trust: route.trust,
+            reportsHop: route.reportsHop))
     }
 
     func urlSession(_ session: URLSession,
                     task: URLSessionTask,
                     didReceive challenge: URLAuthenticationChallenge,
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, on: session, completionHandler: completionHandler)   // givo-31
     }
 
     func urlSession(_ session: URLSession,

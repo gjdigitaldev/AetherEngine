@@ -1008,7 +1008,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         sequentialOrigin: Bool = false,
         heldSourceConnection: Bool = false,
         declaredDurationSeconds: Double? = nil,
-        forwardBufferSegments: Int? = nil
+        forwardBufferSegments: Int? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -1025,6 +1026,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
             .withSourceOpenPolicy(sourceOpenPolicy)
+            .withServerTrust(serverTrust)   // givo-31: every open this session makes itself
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -1167,6 +1169,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .withSourceOpenPolicy(openProfile.sourceOpenPolicy)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
+            .withServerTrust(openProfile.serverTrust)   // givo-31
     }
 
     /// `LoadOptions.sequentialOrigin` for this session. Gates the VOD readError revive
@@ -2748,15 +2751,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
         let url = sourceURL, headers = sourceHTTPHeaders, custom = customIFrameReader
+        let iFrameProfile = DemuxerOpenProfile.iFrameSideDemuxer.withServerTrust(openProfile.serverTrust)   // givo-31
         // The side reader owns the clone from here; `stop()` must not close it a second time.
         customIFrameReader = nil
         let reader = IFrameSideReader(
             open: { dem in
                 if let custom {
                     try dem.open(reader: custom.reader, formatHint: custom.formatHint,
-                                 profile: .iFrameSideDemuxer)
+                                 profile: iFrameProfile)
                 } else {
-                    try dem.open(url: url, extraHeaders: headers, profile: .iFrameSideDemuxer, isLive: false)
+                    try dem.open(url: url, extraHeaders: headers,
+                                 profile: iFrameProfile, isLive: false)
                 }
             },
             cleanup: { custom?.reader.close() },

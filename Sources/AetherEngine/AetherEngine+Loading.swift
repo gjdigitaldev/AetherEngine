@@ -586,6 +586,7 @@ extension AetherEngine {
                       // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
                       surfaceEndFailures: true,
                       httpHeaders: options.httpHeaders,
+                      serverTrust: options.serverTrust,   // givo-31
                       // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting
                       // it back would ping-pong), and hosts can opt out via LoadOptions.
                       armIngestFallback: RemoteHLSIngestFallback.shouldArm(
@@ -670,8 +671,11 @@ extension AetherEngine {
     private func prepareRemoteHLSStandIn(originURL: URL,
                                          options: LoadOptions,
                                          expectedGeneration: UInt64) async -> URL? {
-        let mayNeedRelay = (EngineTLS.serverTrustEvaluator != nil || EngineTLS.serverTrustDecision != nil)   // givo-14
-            && originURL.scheme?.lowercased() == "https"
+        // givo-31: a load with its own trust policy asks only that; one with none, the process-wide hooks.
+        // So another session's allowance never moves this one's bytes through the relay.
+        let answersTrust = options.serverTrust != nil
+            || EngineTLS.serverTrustEvaluator != nil || EngineTLS.serverTrustDecision != nil   // givo-14
+        let mayNeedRelay = answersTrust && originURL.scheme?.lowercased() == "https"
         let tracks = options.isLive
             ? []
             : externalSubtitleRegistry
@@ -681,14 +685,15 @@ extension AetherEngine {
         // Nothing to stand in for, so the origin is never asked.
         guard !tracks.isEmpty || mayNeedRelay else { return nil }
         let needsRelay = mayNeedRelay
-            ? await HLSOriginRelay.systemTrustRefuses(originURL, headers: options.httpHeaders)
+            ? await HLSOriginRelay.systemTrustRefuses(originURL, headers: options.httpHeaders,
+                                                      serverTrust: options.serverTrust)   // givo-31
             : false
         guard !options.isLive || needsRelay else { return nil }
         guard !tracks.isEmpty || needsRelay else { return nil }
 
         guard let prepared = await RemoteHLSSubtitleProxy.prepare(
             originURL: originURL, tracks: tracks, httpHeaders: options.httpHeaders,
-            needsRelay: needsRelay) else { return nil }
+            needsRelay: needsRelay, serverTrust: options.serverTrust) else { return nil }   // givo-31
         // The playlist fetches suspend; a load()/stop() can have superseded this session meanwhile, and a
         // proxy nobody owns would keep its socket and decode task for the rest of the process.
         guard loadGeneration == expectedGeneration else {
@@ -759,7 +764,8 @@ extension AetherEngine {
         if rememberVerdict { rerouteVerdictMemory.record(url, now: Date()) }
         var options = loadedOptions
         options.nativeRemoteHLS = false
-        let reader = HLSLiveIngestReader(playlistURL: url, httpHeaders: options.httpHeaders)
+        let reader = HLSLiveIngestReader(playlistURL: url, httpHeaders: options.httpHeaders,
+                                         serverTrust: options.serverTrust)   // givo-31
         do {
             _ = try await load(source: .custom(reader, formatHint: "mpegts"), options: options)
         } catch is CancellationError {
@@ -785,7 +791,7 @@ extension AetherEngine {
             category: .engine
         )
         let reader = try? await HLSVODIngestReader.makeForIngestRetry(
-            playlistURL: url, httpHeaders: options.httpHeaders)
+            playlistURL: url, httpHeaders: options.httpHeaders, serverTrust: options.serverTrust)   // givo-31
         guard loadGeneration == expectedGeneration else {
             reader?.close()
             return
@@ -921,7 +927,8 @@ extension AetherEngine {
             // the host asked for; without it the flag lasts exactly as long as the pre-opened demuxer.
             heldSourceConnection: loadedOptions.heldSourceConnection,
             declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
-            forwardBufferSegments: loadedOptions.forwardBufferSegments
+            forwardBufferSegments: loadedOptions.forwardBufferSegments,
+            serverTrust: loadedOptions.serverTrust   // givo-31
         )
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
@@ -2087,6 +2094,7 @@ extension AetherEngine {
         let sequentialOrigin = loadedOptions.sequentialOrigin
         let heldSourceConnection = loadedOptions.heldSourceConnection
         let sourceOpenPolicy = loadedOptions.sourceOpenPolicy
+        let serverTrust = loadedOptions.serverTrust   // givo-31
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
@@ -2102,7 +2110,7 @@ extension AetherEngine {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy), isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy).withServerTrust(serverTrust), isLive: isLive)   // givo-31
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2168,6 +2176,7 @@ extension AetherEngine {
         let sequentialOrigin = loadedOptions.sequentialOrigin
         let heldSourceConnection = loadedOptions.heldSourceConnection
         let sourceOpenPolicy = loadedOptions.sourceOpenPolicy
+        let serverTrust = loadedOptions.serverTrust   // givo-31
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
@@ -2181,7 +2190,7 @@ extension AetherEngine {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy))
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy).withServerTrust(serverTrust))   // givo-31
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2459,6 +2468,7 @@ extension AetherEngine {
         let reloadProfile = DemuxerOpenProfile.playback.withProbeBudget(
             probesize: loadedOptions.probesize, maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration)
             .withSourceOpenPolicy(loadedOptions.sourceOpenPolicy)
+            .withServerTrust(loadedOptions.serverTrust)   // givo-31
         var customPreopened: Demuxer? = nil
         if isCustomSource, let reader = customReader {
             let hint = customFormatHint

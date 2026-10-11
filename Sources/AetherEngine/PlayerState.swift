@@ -888,6 +888,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// session: a correction that changes it is refused.
     public var ownCloseReleaseSeconds: Double? = nil
 
+    /// givo-31: this load's own answer to server certificates (`ServerTrustPolicy`), asked by every
+    /// connection the load opens (the source reader and its reconnects and fresh addresses, the held
+    /// connection, the side readers, the HLS ingest, the origin relay, the subtitle proxy and the
+    /// sidecars) instead of `EngineTLS`'s process-wide hooks, so no other load's answer reaches this
+    /// one and this one's reaches no other. Its connections run in URL sessions of their own. nil (the
+    /// default) keeps the process-wide hooks. Names the session: a correction that changes it is
+    /// refused.
+    public var serverTrust: ServerTrustPolicy? = nil
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on

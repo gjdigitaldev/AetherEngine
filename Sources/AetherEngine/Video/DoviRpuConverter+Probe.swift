@@ -78,7 +78,8 @@ extension AetherEngine {
         options: LoadOptions = .init()
     ) throws -> DoviConvertProbeResult {
         let demuxer = Demuxer()
-        try demuxer.open(url: url, extraHeaders: options.httpHeaders)
+        try demuxer.open(url: url, extraHeaders: options.httpHeaders,
+                         profile: DemuxerOpenProfile.playback.withServerTrust(options.serverTrust))   // givo-31
         defer { demuxer.close() }
 
         let videoIdx = demuxer.videoStreamIndex

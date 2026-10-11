@@ -89,6 +89,17 @@ struct DemuxerOpenProfile: Sendable {
         return copy
     }
 
+    /// givo-31: the load's `LoadOptions.serverTrust`, which every connection this demuxer's readers
+    /// open asks (the disc reader, the stream reader and its held connection, the Profile 5 audit's
+    /// second open). Rides in the profile so every reopen of the session inherits it.
+    var serverTrust: ServerTrustPolicy? = nil
+
+    func withServerTrust(_ trust: ServerTrustPolicy?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.serverTrust = trust
+        return copy
+    }
+
     /// Whether a probe of an untagged 10-bit HEVC source may read its first RPU to find a Dolby Vision
     /// Profile 5 the container never recorded (`DolbyVisionRecordAudit.addRecordIfProfile5`). On for every
     /// playback open, so the probe, the HLS producer's own open and every rebuild agree; off for the
@@ -727,7 +738,8 @@ public final class Demuxer: @unchecked Sendable {
         // the source is not a recognizable disc, fall through to the streaming reader.
         if !isLive, Self.isDiscImageURL(url) {
             let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
-            if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
+            if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm,
+                                                          serverTrust: openProfile.serverTrust) {   // givo-31
                 adoptOwnedSourceReader(discReader)
                 if isCloseRequested {
                     releaseOwnedSourceReader()
@@ -771,7 +783,8 @@ public final class Demuxer: @unchecked Sendable {
             boundedInitialFetch: openProfile.boundedInitialFetch,
             sequentialOnly: openProfile.avioSequentialOnly,
             heldConnection: openProfile.avioHeldConnection,
-            sourceOpenPolicy: openProfile.sourceOpenPolicy
+            sourceOpenPolicy: openProfile.sourceOpenPolicy,
+            serverTrust: openProfile.serverTrust   // givo-31
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
@@ -1048,7 +1061,8 @@ public final class Demuxer: @unchecked Sendable {
             let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
             if idx >= 0, let codecpar = ctx.pointee.streams[Int(idx)]?.pointee.codecpar {
                 DolbyVisionRecordAudit.addRecordIfProfile5(
-                    codecpar: codecpar, url: source.url, extraHeaders: source.headers)
+                    codecpar: codecpar, url: source.url, extraHeaders: source.headers,
+                    serverTrust: openProfile.serverTrust)   // givo-31
             }
         }
     }

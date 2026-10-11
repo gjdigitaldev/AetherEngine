@@ -734,6 +734,7 @@ extension AetherEngine {
         let isCustom = isCustomSource
         if isCustom, customReader == nil { return }
         let headers = loadedOptions.httpHeaders
+        let sideTrust = loadedOptions.serverTrust   // givo-31
         let formatHint = customFormatHint
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
@@ -787,7 +788,8 @@ extension AetherEngine {
                     url: url, reader: attemptReader, formatHint: formatHint, headers: headers,
                     startAt: resumeAt, callerProbesize: probesize,
                     callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                    selectTitleID: titleID, store: store, leadSeconds: lead, link: link)
+                    selectTitleID: titleID, store: store, leadSeconds: lead, link: link,
+                    serverTrust: sideTrust)   // givo-31
                 guard outcome.exit.isRestartable, !Task.isCancelled else { return }
 
                 guard let backoff = budget.chargeFailure(harvested: outcome.harvested) else {
@@ -839,11 +841,12 @@ extension AetherEngine {
         url: URL, reader: IOReader?, formatHint: String?, headers: [String: String],
         startAt: Double, callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
         selectTitleID: Int?, store: SubtitlePacketStore, leadSeconds: Double,
-        link: SideReaderLinkArbiter?
+        link: SideReaderLinkArbiter?, serverTrust: ServerTrustPolicy?
     ) async -> SubtitleForwardPrefetcher.Outcome {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
             callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration).withReaderLabel("prefetch")
+            .withServerTrust(serverTrust)   // givo-31
         let registered = await MainActor.run { [weak self] () -> Bool in
             guard !Task.isCancelled, let self else { return false }
             self.subtitleForwardPrefetchDemuxer = demuxer
@@ -1456,7 +1459,8 @@ extension AetherEngine {
             table: nativeSubtitleTrackTable,
             registry: externalSubtitleRegistry,
             stores: session.nativeSubtitleCueStoresForSession,
-            defaultHeaders: loadedOptions.httpHeaders)
+            defaultHeaders: loadedOptions.httpHeaders,
+            serverTrust: loadedOptions.serverTrust)   // givo-31
         guard !jobs.isEmpty else { return }
         externalNativeStoreFillTask = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
@@ -1474,7 +1478,8 @@ extension AetherEngine {
     nonisolated static func runExternalSubtitleFill(job: ExternalSubtitleFillJob) async {
         if let results = try? await SubtitleDecoder.decodeFile(
             url: job.url, httpHeaders: job.headers,
-            sourceStreamIndices: job.targets.map(\.streamIndex)
+            sourceStreamIndices: job.targets.map(\.streamIndex),
+            serverTrust: job.serverTrust   // givo-31
         ) {
             for (target, result) in zip(job.targets, results) {
                 target.store.appendCues(result.cues)
@@ -1490,7 +1495,8 @@ extension AetherEngine {
         for target in job.targets {
             if Task.isCancelled { return }
             guard let result = try? await SubtitleDecoder.decodeFile(
-                url: job.url, httpHeaders: job.headers, sourceStreamIndex: target.streamIndex
+                url: job.url, httpHeaders: job.headers, sourceStreamIndex: target.streamIndex,
+                serverTrust: job.serverTrust   // givo-31
             ) else {
                 EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent) stream=\(target.streamIndex.map(String.init) ?? "auto")", category: .engine)
                 continue
@@ -1544,6 +1550,7 @@ extension AetherEngine {
         isLoadingSubtitles = true
 
         let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
+        let sidecarTrust = loadedOptions.serverTrust   // givo-31
         // ASS/SSA sidecars honour preserveASSMarkup so hosts can drive a styled renderer. SRT/VTT fall back to plain text regardless.
         let preserveASS = loadedOptions.preserveASSMarkup
         sidecarTask = Task { [weak self] in
@@ -1552,7 +1559,8 @@ extension AetherEngine {
                 result = try await SubtitleDecoder.decodeFile(
                     url: url, httpHeaders: effectiveHeaders,
                     preserveASSMarkup: preserveASS,
-                    sourceStreamIndex: sourceStreamIndex
+                    sourceStreamIndex: sourceStreamIndex,
+                    serverTrust: sidecarTrust   // givo-31
                 )
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
@@ -1610,12 +1618,14 @@ extension AetherEngine {
         isLoadingSecondarySubtitles = true
 
         let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
+        let sidecarTrust = loadedOptions.serverTrust   // givo-31
         secondarySidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
             do {
                 // Secondary is plain text only (never drives libass, mirroring embedded secondary #47).
                 result = try await SubtitleDecoder.decodeFile(
-                    url: url, httpHeaders: effectiveHeaders, sourceStreamIndex: sourceStreamIndex)
+                    url: url, httpHeaders: effectiveHeaders, sourceStreamIndex: sourceStreamIndex,
+                    serverTrust: sidecarTrust)   // givo-31
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -1742,6 +1752,7 @@ extension AetherEngine {
             customClone = clone
         }
         let headers = loadedOptions.httpHeaders
+        let sideTrust = loadedOptions.serverTrust   // givo-31
         let formatHint = customFormatHint
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
@@ -1769,7 +1780,8 @@ extension AetherEngine {
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
                 pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                selectTitleID: titleID, readToEOF: readToEOF, link: link
+                selectTitleID: titleID, readToEOF: readToEOF, link: link,
+                serverTrust: sideTrust   // givo-31
             )
         }
     }
@@ -1829,11 +1841,12 @@ extension AetherEngine {
         startAt: Double, videoWidth: Int32, videoHeight: Int32,
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
         selectTitleID: Int? = nil, readToEOF: Bool = false,
-        link: SideReaderLinkArbiter? = nil
+        link: SideReaderLinkArbiter? = nil, serverTrust: ServerTrustPolicy? = nil
     ) async {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
             callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration).withReaderLabel("nativesubs")
+            .withServerTrust(serverTrust)   // givo-31
         let registered = await MainActor.run { [weak self] () -> Bool in
             guard !Task.isCancelled, let self else { return false }
             self.nativeSubtitleReadersDemuxer = demuxer
@@ -2251,7 +2264,8 @@ extension AetherEngine {
         table: [NativeSubtitleTrackEntry],
         registry: [Int: ExternalSubtitleTrack],
         stores: [NativeSubtitleCueStore],
-        defaultHeaders: [String: String]
+        defaultHeaders: [String: String],
+        serverTrust: ServerTrustPolicy? = nil
     ) -> [ExternalSubtitleFillJob] {
         struct Key: Hashable {
             let url: URL
@@ -2270,7 +2284,8 @@ extension AetherEngine {
                 .init(streamIndex: track.sourceStreamIndex, store: stores[ordinal]))
         }
         return order.map {
-            ExternalSubtitleFillJob(url: $0.url, headers: $0.headers, targets: targetsByKey[$0] ?? [])
+            ExternalSubtitleFillJob(url: $0.url, headers: $0.headers, targets: targetsByKey[$0] ?? [],
+                                    serverTrust: serverTrust)   // givo-31
         }
     }
 

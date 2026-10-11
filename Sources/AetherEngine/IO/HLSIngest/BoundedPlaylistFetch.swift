@@ -139,7 +139,7 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     didReceive challenge: URLAuthenticationChallenge,
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, on: session, completionHandler: completionHandler)   // givo-31: the session's policy
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,

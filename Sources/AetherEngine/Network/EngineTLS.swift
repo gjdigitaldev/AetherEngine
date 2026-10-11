@@ -89,6 +89,29 @@ public enum EngineTLS {
     /// for tasks that missed a per-task delegate.
     static let sessionDelegate = SessionTrustDelegate()
 
+    /// givo-31: the session-level delegate for a connection opened under `trust`, or the shared one
+    /// (the process-wide hooks) for a connection opened under none.
+    static func sessionDelegate(for trust: ServerTrustPolicy?) -> SessionTrustDelegate {
+        trust?.sessionDelegate ?? sessionDelegate
+    }
+
+    /// givo-31: the redirect rule without the trust answer, for a session that must see system trust
+    /// alone, reporting its hops to `trust` (or to `redirectObserver` when there is none).
+    static func redirectDelegate(for trust: ServerTrustPolicy?) -> RedirectScrubbingDelegate {
+        guard let trust else { return redirectDelegate }
+        return RedirectScrubbingDelegate(trust: trust)
+    }
+
+    /// givo-31: a redirect an engine request is about to follow, told to the policy the request was
+    /// made under, and to the process-wide `redirectObserver` only for a request made under none.
+    static func noteRedirect(from original: URL?, to target: URL, trust: ServerTrustPolicy?) {
+        if let trust {
+            trust.noteRedirect(from: original, to: target)
+        } else {
+            redirectObserver?(original, target)
+        }
+    }
+
     /// The redirect rule without the trust answer, for a session that must see
     /// system trust alone (`HLSOriginRelay.systemTrustRefuses`).
     static let redirectDelegate = RedirectScrubbingDelegate()
@@ -103,21 +126,9 @@ public enum EngineTLS {
     ) {
         // givo-14: the host's three-way answer first.
         if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           let decide = serverTrustDecision {
-            switch decide(challenge.protectionSpace) {
-            case .accept:
-                if let trust = challenge.protectionSpace.serverTrust {
-                    completionHandler(.useCredential, URLCredential(trust: trust))
-                    return
-                }
-            case .reject:
-                noteRefused(host: challenge.protectionSpace.host, port: challenge.protectionSpace.port)
-                EngineLog.emit("[EngineTLS] the host refused this origin's certificate (givo-14)", category: .demux)
-                completionHandler(.cancelAuthenticationChallenge, nil)
-                return
-            case .systemDefault:
-                break
-            }
+           let decide = serverTrustDecision,
+           answer(decide(challenge.protectionSpace), to: challenge, completionHandler: completionHandler) {
+            return
         }
         guard
             challenge.protectionSpace.authenticationMethod
@@ -132,6 +143,70 @@ public enum EngineTLS {
         completionHandler(.useCredential, URLCredential(trust: trust))
     }
 
+    /// givo-31: the disposition for a connection opened under `trust`. A load's policy answers alone:
+    /// `.systemDefault` is the system's own handling, never the process-wide hooks, which answer only
+    /// for connections opened under no policy (nil `trust` takes that path unchanged).
+    static func resolve(
+        _ challenge: URLAuthenticationChallenge,
+        trust: ServerTrustPolicy?,
+        completionHandler: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard let trust else {
+            resolve(challenge, completionHandler: completionHandler)
+            return
+        }
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           answer(trust.decision(for: challenge.protectionSpace), to: challenge,
+                  completionHandler: completionHandler) {
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
+    }
+
+    /// givo-31: a task-level challenge, answered for the policy the task's session was opened under (its
+    /// session delegate's), so a per-task delegate on a policy's session cannot answer for another one.
+    static func resolve(
+        _ challenge: URLAuthenticationChallenge,
+        on session: URLSession,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if let bound = session.delegate as? SessionTrustDelegate {
+            bound.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+        } else {
+            resolve(challenge, completionHandler: completionHandler)
+        }
+    }
+
+    /// givo-31: where a task on `session` reports a redirect hop: its session delegate's policy, the
+    /// process-wide observer for a shared session, nowhere for a policy's session whose policy is gone.
+    static func redirectRoute(of session: URLSession) -> (trust: ServerTrustPolicy?, reportsHop: Bool) {
+        guard let scrubbing = session.delegate as? RedirectScrubbingDelegate else { return (nil, true) }
+        let trust = scrubbing.trust
+        return (trust, !scrubbing.isPolicyBound || trust != nil)
+    }
+
+    /// givo-14 · givo-31: answers a server-trust challenge with `.accept` / `.reject`; false (nothing
+    /// answered) for `.systemDefault`, and for an accept with no trust object to vouch for.
+    private static func answer(
+        _ decision: ServerTrustDecision,
+        to challenge: URLAuthenticationChallenge,
+        completionHandler: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) -> Bool {
+        switch decision {
+        case .accept:
+            guard let trust = challenge.protectionSpace.serverTrust else { return false }
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return true
+        case .reject:
+            noteRefused(host: challenge.protectionSpace.host, port: challenge.protectionSpace.port)
+            EngineLog.emit("[EngineTLS] the host refused this origin's certificate (givo-14)", category: .demux)
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return true
+        case .systemDefault:
+            return false
+        }
+    }
+
     /// Audit NET-108: URLSession's own redirect copies every custom header
     /// except `Authorization` to the new request (measured on CFNetwork 3896:
     /// `X-Emby-Token`, `Cookie`, `Range` and `Referer` all reached a cross-host
@@ -140,6 +215,33 @@ public enum EngineTLS {
     /// (AVIOReader, SourcePrewarmFetcher) still answers for its task; one that
     /// does not (the relay's pump) falls back to this.
     class RedirectScrubbingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        /// givo-31: the policy the session's connections were opened under, nil for the process-wide
+        /// hooks. Weak: a policy owns the delegate its own sessions carry, and a policy no load holds
+        /// any more answers nothing (the system's handling).
+        private(set) weak var trust: ServerTrustPolicy?
+        /// givo-31: whether this delegate answers for a policy at all (the weak reference reads nil
+        /// both for "none" and for "released", which must not fall back to the process-wide hooks).
+        let isPolicyBound: Bool
+
+        override init() {
+            isPolicyBound = false
+            super.init()
+        }
+
+        init(trust: ServerTrustPolicy) {
+            self.trust = trust
+            isPolicyBound = true
+            super.init()
+        }
+
+        /// A policy's own delegate, made inside the policy's init and bound to it there.
+        fileprivate init(unboundPolicy: Void) {
+            isPolicyBound = true
+            super.init()
+        }
+
+        fileprivate func bind(_ trust: ServerTrustPolicy) { self.trust = trust }
+
         func urlSession(
             _ session: URLSession,
             task: URLSessionTask,
@@ -148,11 +250,16 @@ public enum EngineTLS {
             completionHandler: @escaping (URLRequest?) -> Void
         ) {
             let original = task.originalRequest
+            // givo-31: a policy's own delegate reports to its policy; an unbound one used as a task's
+            // delegate reports where the task's session does (its policy, or the process-wide observer).
+            let route = isPolicyBound ? (trust: trust, reportsHop: trust != nil) : EngineTLS.redirectRoute(of: session)
             completionHandler(RedirectHeaderPolicy.redirectRequest(
                 request,
                 originalURL: original?.url,
                 originalRange: original?.value(forHTTPHeaderField: "Range"),
-                extraHeaders: [:]))
+                extraHeaders: [:],
+                trust: route.trust,
+                reportsHop: route.reportsHop))
         }
     }
 
@@ -163,7 +270,84 @@ public enum EngineTLS {
             completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?)
                 -> Void
         ) {
-            EngineTLS.resolve(challenge, completionHandler: completionHandler)
+            guard isPolicyBound else {
+                EngineTLS.resolve(challenge, completionHandler: completionHandler)
+                return
+            }
+            // givo-31: a released policy accepts nothing on anyone's behalf.
+            guard let trust else {
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+            EngineTLS.resolve(challenge, trust: trust, completionHandler: completionHandler)
         }
+    }
+}
+
+/// givo-31: one load's own answer to server certificates.
+///
+/// `EngineTLS`'s hooks are process-wide, so a host that accepts one source's private certificate
+/// accepts it for every session, warm and relay that reaches the same host, whichever source that
+/// session plays. A policy belongs to one load (`LoadOptions.serverTrust`) or one warm
+/// (`AetherEngine.prewarm(url:httpHeaders:byteBudget:serverTrust:)`), and every connection that
+/// load opens asks it, and only it: the source reader and its reconnects and fresh addresses, the
+/// held connection, the side readers, the HLS ingest, the origin relay, the subtitle proxy and the
+/// sidecars. Connections opened under no policy keep the process-wide hooks.
+///
+/// Connections opened under a policy run in URL sessions of their own, so a connection whose
+/// certificate one policy accepted is never pooled into a request made under another policy, or
+/// under none. The sessions go when the policy does.
+public final class ServerTrustPolicy: @unchecked Sendable, Equatable {
+
+    private let decide: @Sendable (URLProtectionSpace) -> EngineTLS.ServerTrustDecision
+    private let onRedirect: (@Sendable (_ original: URL?, _ target: URL) -> Void)?
+
+    /// The delegate every session opened under this policy carries.
+    let sessionDelegate: EngineTLS.SessionTrustDelegate
+
+    private let poolLock = NSLock()
+    private var pool: [String: URLSession] = [:]
+
+    /// - Parameters:
+    ///   - decide: asked per server-trust challenge of a connection this policy's load opens:
+    ///     `.accept` trusts the certificate, `.reject` refuses it even where system trust would accept
+    ///     it (the open fails as a certificate rejection), `.systemDefault` is the system's handling.
+    ///     The process-wide hooks are not asked. Called off the main actor, so it has to be
+    ///     thread-safe.
+    ///   - onRedirect: told (the request's original URL, the next hop) for every redirect a request
+    ///     made under this policy is about to follow, before the hop is requested, so `decide` can
+    ///     answer for the hosts this load's source redirects to and for no other load's. Same
+    ///     threading rules.
+    public init(decide: @escaping @Sendable (URLProtectionSpace) -> EngineTLS.ServerTrustDecision,
+                onRedirect: (@Sendable (_ original: URL?, _ target: URL) -> Void)? = nil) {
+        self.decide = decide
+        self.onRedirect = onRedirect
+        self.sessionDelegate = EngineTLS.SessionTrustDelegate(unboundPolicy: ())
+        sessionDelegate.bind(self)
+    }
+
+    deinit {
+        poolLock.lock()
+        let sessions = Array(pool.values)
+        pool.removeAll()
+        poolLock.unlock()
+        for session in sessions { session.finishTasksAndInvalidate() }
+    }
+
+    public static func == (lhs: ServerTrustPolicy, rhs: ServerTrustPolicy) -> Bool { lhs === rhs }
+
+    func decision(for space: URLProtectionSpace) -> EngineTLS.ServerTrustDecision { decide(space) }
+
+    func noteRedirect(from original: URL?, to target: URL) { onRedirect?(original, target) }
+
+    /// This policy's own long-lived session for `key` (one per shared engine session it stands in for),
+    /// made on first use from `configuration`.
+    func pooledSession(_ key: String, configuration: () -> URLSessionConfiguration) -> URLSession {
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        if let session = pool[key] { return session }
+        let session = URLSession(configuration: configuration(), delegate: sessionDelegate, delegateQueue: nil)
+        pool[key] = session
+        return session
     }
 }

@@ -187,4 +187,26 @@ struct RedirectHeaderPolicyTests {
         #expect(seen.hops.first?.0?.host == "panel.givo-10.example")
         #expect(seen.hops.first?.1.host == "edge.givo-10.example")
     }
+
+    // givo-31: a hop made under a load's policy is that policy's to learn (the process-wide observer is
+    // asked only for a request made under none; not set here, since the suite above owns it).
+    @Test("A hop made under a load's policy reaches that policy")
+    func redirectUnderAPolicyReachesThatPolicy() {
+        final class Seen: @unchecked Sendable {
+            let lock = NSLock()
+            var policyHops: [URL] = []
+        }
+        let seen = Seen()
+        let policy = ServerTrustPolicy(decide: { _ in .systemDefault }, onRedirect: { _, target in
+            seen.lock.lock(); seen.policyHops.append(target); seen.lock.unlock()
+        })
+        _ = RedirectHeaderPolicy.redirectRequest(
+            URLRequest(url: url("https://edge.givo-31.example/movie/42.mkv")),
+            originalURL: url("https://panel.givo-31.example/movie/u/p/42.mkv"),
+            originalRange: nil,
+            extraHeaders: [:],
+            trust: policy)
+        seen.lock.lock(); defer { seen.lock.unlock() }
+        #expect(seen.policyHops.map(\.host) == ["edge.givo-31.example"])
+    }
 }

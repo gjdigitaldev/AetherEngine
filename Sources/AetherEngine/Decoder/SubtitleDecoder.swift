@@ -48,11 +48,12 @@ enum SubtitleDecoder {
         url: URL,
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false,
-        sourceStreamIndex: Int32? = nil
+        sourceStreamIndex: Int32? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndex.map { [$0] }
+            requested: sourceStreamIndex.map { [$0] }, serverTrust: serverTrust
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -67,12 +68,13 @@ enum SubtitleDecoder {
         url: URL,
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false,
-        sourceStreamIndices: [Int32?]
+        sourceStreamIndices: [Int32?],
+        serverTrust: ServerTrustPolicy? = nil
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndices
+            requested: sourceStreamIndices, serverTrust: serverTrust
         )
     }
 
@@ -81,7 +83,8 @@ enum SubtitleDecoder {
         url: URL,
         httpHeaders: [String: String],
         preserveASSMarkup: Bool,
-        requested: [Int32?]?
+        requested: [Int32?]?,
+        serverTrust: ServerTrustPolicy?   // givo-31: a sidecar is read under its session's policy
     ) async throws -> [SidecarDecodeResult] {
         // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
         // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
@@ -90,7 +93,8 @@ enum SubtitleDecoder {
             try await BlockingWork.detached(priority: .userInitiated) {
                 try decodeFileSync(
                     url: url, httpHeaders: httpHeaders,
-                    preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token
+                    preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token,
+                    serverTrust: serverTrust
                 )
             }.value
         } onCancel: {
@@ -357,7 +361,8 @@ enum SubtitleDecoder {
 
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
-        preserveASSMarkup: Bool, requested: [Int32?]?, cancel: CancelFlag
+        preserveASSMarkup: Bool, requested: [Int32?]?, cancel: CancelFlag,
+        serverTrust: ServerTrustPolicy?
     ) throws -> [SidecarDecodeResult] {
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
@@ -365,7 +370,7 @@ enum SubtitleDecoder {
         var avioReader: AVIOReader?
 
         if isHTTP {
-            let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
+            let reader = AVIOReader(url: url, extraHeaders: httpHeaders, serverTrust: serverTrust)   // givo-31
             // Register BEFORE open(): open does a synchronous network probe (up to ~60 s on stalled origins);
             // cancellation during the probe must abort via markClosed rather than waiting for timeout (#32).
             cancel.register(reader)

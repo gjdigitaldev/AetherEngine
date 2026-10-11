@@ -119,6 +119,9 @@ final class HeldSourceConnection: @unchecked Sendable {
     private var lastParkSeconds: Double = 0
     /// givo-23: the source address's age and connection count when this connection started.
     private let addressNote: String
+    /// givo-31: the load's trust policy: the handshake asks it, and the hops this path follows are
+    /// reported to it.
+    private let serverTrust: ServerTrustPolicy?
     private var connectStartedAt: Date?
 
     init(url: URL,
@@ -129,8 +132,10 @@ final class HeldSourceConnection: @unchecked Sendable {
          generation: Int = 0,
          ticket: OriginRequestBudget.Ticket? = nil,
          addressNote: String = "",
+         serverTrust: ServerTrustPolicy? = nil,
          delegate: HeldSourceConnectionDelegate) {
         self.addressNote = addressNote   // givo-23
+        self.serverTrust = serverTrust   // givo-31
         self.respondedBy = url
         self.offset = offset
         self.extraHeaders = extraHeaders
@@ -237,7 +242,7 @@ final class HeldSourceConnection: @unchecked Sendable {
                 hops += 1
                 closeSocket()
                 OriginRequestBudget.shared.noteRedirect(from: source, to: next)
-                EngineTLS.redirectObserver?(source, next)   // givo-12: the hop this path follows itself
+                EngineTLS.noteRedirect(from: source, to: next, trust: serverTrust)   // givo-12 · givo-31: the hop this path follows itself
                 target = next
                 continue
             }
@@ -269,7 +274,7 @@ final class HeldSourceConnection: @unchecked Sendable {
         configuration.timeoutIntervalForRequest = Self.readTimeout
         configuration.timeoutIntervalForResource = .greatestFiniteMagnitude
         let session = URLSession(configuration: configuration,
-                                 delegate: EngineTLS.sessionDelegate,
+                                 delegate: EngineTLS.sessionDelegate(for: serverTrust),   // givo-31
                                  delegateQueue: nil)
         let task = session.streamTask(withHostName: host, port: port)
 

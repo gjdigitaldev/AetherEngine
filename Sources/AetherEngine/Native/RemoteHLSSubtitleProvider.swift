@@ -27,6 +27,8 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     private let programDuration: Double
     private let stores: [NativeSubtitleCueStore]
     private let defaultHeaders: [String: String]
+    /// givo-31: the session's trust policy, for the sidecar decodes the fill makes.
+    private let serverTrust: ServerTrustPolicy?
     /// Guards `fillTask` alone: the fill is started from the proxy's build (off the main actor) and
     /// cancelled from the engine's teardown (on it), so the handle is genuinely shared.
     private let fillLock = NSLock()
@@ -41,7 +43,9 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
 
     init(tracks: [Track], masterBody: String, programDuration: Double,
          defaultHeaders: [String: String],
+         serverTrust: ServerTrustPolicy? = nil,
          vttFillWaitSeconds: TimeInterval = defaultVTTFillWaitSeconds) {
+        self.serverTrust = serverTrust   // givo-31
         self.tracks = tracks
         self.staticMasterPlaylistBody = masterBody
         // `RemoteHLSSubtitleProxy.sumSegmentDurations` already refuses a non-finite, negative or
@@ -79,7 +83,8 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// once and a single bad stream index cannot blank its siblings.
     func startFill() {
         cancelFill()
-        let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders)
+        let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders,
+                                 serverTrust: serverTrust)   // givo-31
         guard !jobs.isEmpty else { return }
         let task = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
@@ -127,7 +132,8 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// `AetherEngine.externalSubtitleFillJobs`, which keys off the loopback's rendition table.
     static func fillJobs(tracks: [Track],
                          stores: [NativeSubtitleCueStore],
-                         defaultHeaders: [String: String]) -> [AetherEngine.ExternalSubtitleFillJob] {
+                         defaultHeaders: [String: String],
+                         serverTrust: ServerTrustPolicy? = nil) -> [AetherEngine.ExternalSubtitleFillJob] {
         struct Key: Hashable {
             let url: URL
             let headers: [String: String]
@@ -142,7 +148,8 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         }
         return order.map {
             AetherEngine.ExternalSubtitleFillJob(url: $0.url, headers: $0.headers,
-                                                 targets: targetsByKey[$0] ?? [])
+                                                 targets: targetsByKey[$0] ?? [],
+                                                 serverTrust: serverTrust)   // givo-31
         }
     }
 

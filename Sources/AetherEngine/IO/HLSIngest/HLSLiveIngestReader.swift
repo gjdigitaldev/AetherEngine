@@ -27,6 +27,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// legitimately long playlist, and this one is refetched every few seconds rather than once.
     static let maximumPlaylistBytes = 8 * 1024 * 1024
     private let session: URLSession
+    /// givo-31: the load's `LoadOptions.serverTrust`; a fresh reader and the companion inherit it.
+    private let serverTrust: ServerTrustPolicy?
     private var ingestTask: Task<Void, Never>?
     private let startLock = NSLock()
     private var started = false
@@ -203,17 +205,24 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         self.init(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
     }
 
+    /// givo-31: an engine-made reader, whose fetches ask the load's trust policy.
+    convenience init(playlistURL: URL, httpHeaders: [String: String], serverTrust: ServerTrustPolicy?) {
+        self.init(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo, serverTrust: serverTrust)
+    }
+
     /// #199: fresh reader over the same playlist URL and headers, for the in-engine live reopen of an
     /// engine-created ingest session (the dead reader's construction inputs are immutable, so the fresh
     /// one rejoins the same channel at its current live edge). Main-video role only: the companion
     /// audio reader's lifetime is owned by its parent and never reopens independently.
     func makeFreshMainReader() -> HLSLiveIngestReader? {
         guard role == .mainVideo else { return nil }
-        return HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
+        return HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo,
+                                   serverTrust: serverTrust)   // givo-31
     }
 
     init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
-         credentialOrigin: URL? = nil) {
+         credentialOrigin: URL? = nil, serverTrust: ServerTrustPolicy? = nil) {
+        self.serverTrust = serverTrust   // givo-31
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
         self.credentialOrigin = credentialOrigin ?? playlistURL
@@ -223,7 +232,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         config.timeoutIntervalForResource = 30
         // 30s resource ceiling: one-shot fetches must fail fast so the host can fall back. The c7592ed no-ceiling lesson applies to long-lived stream connections, not bounded one-shot fetches.
         self.session = URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+            configuration: config, delegate: EngineTLS.sessionDelegate(for: serverTrust), delegateQueue: nil)   // givo-31
     }
 
     // MARK: - IOReader
@@ -551,7 +560,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 )
                 installCompanion(HLSLiveIngestReader(
                     playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio,
-                    credentialOrigin: credentialOrigin))
+                    credentialOrigin: credentialOrigin, serverTrust: serverTrust))   // givo-31
             }
             // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
             // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.

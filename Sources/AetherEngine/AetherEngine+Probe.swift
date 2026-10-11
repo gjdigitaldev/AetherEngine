@@ -185,7 +185,8 @@ extension AetherEngine {
                         guard let file = FileIOReader(url: u) else { throw DemuxerError.openFailed(code: -1) }
                         reader = file
                     } else if ["http", "https"].contains(u.scheme?.lowercased() ?? "") {
-                        reader = ProbeHTTPReader(url: u, headers: options.httpHeaders, control: control)
+                        reader = ProbeHTTPReader(url: u, headers: options.httpHeaders, control: control,
+                                                 serverTrust: options.serverTrust)   // givo-31
                     } else {
                         throw ProbeError.unsupportedURL
                     }
@@ -196,7 +197,8 @@ extension AetherEngine {
                     try control.check()
                     try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits))
                 } else {
-                    try demuxer.open(url: u, extraHeaders: options.httpHeaders)
+                    try demuxer.open(url: u, extraHeaders: options.httpHeaders,
+                                     profile: DemuxerOpenProfile.playback.withServerTrust(options.serverTrust))   // givo-31
                 }
             case .custom(let reader, let formatHint):
                 displayURL = URL(string: "aether-custom://source")!
@@ -375,7 +377,8 @@ extension AetherEngine {
         options: LoadOptions = .init()
     ) throws -> SoftwareDecodeProbeResult {
         let demuxer = Demuxer()
-        try demuxer.open(url: url, extraHeaders: options.httpHeaders)
+        try demuxer.open(url: url, extraHeaders: options.httpHeaders,
+                         profile: DemuxerOpenProfile.playback.withServerTrust(options.serverTrust))   // givo-31
         defer { demuxer.close() }
         return try swDecodeProbeRun(demuxer: demuxer, maxPackets: maxPackets)
     }

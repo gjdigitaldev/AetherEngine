@@ -54,13 +54,14 @@ enum RemoteHLSSubtitleProxy {
     static func prepare(originURL: URL,
                         tracks: [RemoteHLSSubtitleProvider.Track],
                         httpHeaders: [String: String],
-                        needsRelay: Bool) async -> Prepared? {
+                        needsRelay: Bool,
+                        serverTrust: ServerTrustPolicy? = nil) async -> Prepared? {
         guard !tracks.isEmpty || needsRelay else { return nil }
         if !tracks.isEmpty {
             do {
                 let prepared = try await build(
                     originURL: originURL, tracks: tracks, httpHeaders: httpHeaders,
-                    needsRelay: needsRelay)
+                    needsRelay: needsRelay, serverTrust: serverTrust)   // givo-31
                 EngineLog.emit(
                     "[AetherEngine] #316: serving \(tracks.count) external subtitle rendition(s) over a "
                     + "rewritten master at \(prepared.masterURL.absoluteString), media "
@@ -75,13 +76,14 @@ enum RemoteHLSSubtitleProxy {
             }
         }
         guard needsRelay else { return nil }
-        return relayOnly(originURL: originURL, httpHeaders: httpHeaders)
+        return relayOnly(originURL: originURL, httpHeaders: httpHeaders, serverTrust: serverTrust)   // givo-31
     }
 
     /// The AE#495 half with nothing to inject: no provider, no playlist reads, and the player is
     /// pointed at the relay's own address for the origin.
-    private static func relayOnly(originURL: URL, httpHeaders: [String: String]) -> Prepared? {
-        let relay = HLSOriginRelay()
+    private static func relayOnly(originURL: URL, httpHeaders: [String: String],
+                                  serverTrust: ServerTrustPolicy?) -> Prepared? {
+        let relay = HLSOriginRelay(serverTrust: serverTrust)   // givo-31
         relay.grantCredentials(to: originURL, httpHeaders: httpHeaders)
         let server = HLSLocalServer(relay: relay)
         do {
@@ -120,8 +122,9 @@ enum RemoteHLSSubtitleProxy {
     private static func build(originURL: URL,
                               tracks: [RemoteHLSSubtitleProvider.Track],
                               httpHeaders: [String: String],
-                              needsRelay: Bool) async throws -> Prepared {
-        let session = makeSession()
+                              needsRelay: Bool,
+                              serverTrust: ServerTrustPolicy?) async throws -> Prepared {
+        let session = makeSession(serverTrust: serverTrust)   // givo-31
         defer { session.finishTasksAndInvalidate() }
         // Audit NAT-105: the variant is whatever the master names, on any host or scheme, so the
         // host's credentials go only where the host sent them.
@@ -140,8 +143,9 @@ enum RemoteHLSSubtitleProxy {
 
         let provider = RemoteHLSSubtitleProvider(tracks: tracks, masterBody: master,
                                                  programDuration: duration,
-                                                 defaultHeaders: httpHeaders)
-        let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay() : nil
+                                                 defaultHeaders: httpHeaders,
+                                                 serverTrust: serverTrust)   // givo-31
+        let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay(serverTrust: serverTrust) : nil   // givo-31
         // Audit NET-109: the grant belongs to the URL the host handed over. A redirect target is
         // only allowed, or a cross-host redirect would move the token to the edge and leave the
         // host's own origin without it.
@@ -177,13 +181,13 @@ enum RemoteHLSSubtitleProxy {
 
     // MARK: - Playlist reads
 
-    private static func makeSession() -> URLSession {
+    private static func makeSession(serverTrust: ServerTrustPolicy?) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = budgetSeconds / 2
         config.timeoutIntervalForResource = budgetSeconds
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+            configuration: config, delegate: EngineTLS.sessionDelegate(for: serverTrust), delegateQueue: nil)   // givo-31
     }
 
     /// Matches the sibling HLS fetchers (`HLSCarriageProbe`, `HLSVODIngestReader`). This proxy fetches

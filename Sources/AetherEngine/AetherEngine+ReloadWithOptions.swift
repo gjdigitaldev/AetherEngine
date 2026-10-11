@@ -279,6 +279,7 @@ enum SessionOptionCorrection {
         "carryIdentityHeadersAcrossRedirects",
         "sourceURLRefresher",
         "ownCloseReleaseSeconds",
+        "serverTrust",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -325,6 +326,8 @@ enum SessionOptionCorrection {
         // givo-20: both are registered when the load opened the source.
         if proposed.sourceURLRefresher != current.sourceURLRefresher { refused.append("sourceURLRefresher") }
         if proposed.ownCloseReleaseSeconds != current.ownCloseReleaseSeconds { refused.append("ownCloseReleaseSeconds") }
+        // givo-31: every connection of the session was opened under it.
+        if proposed.serverTrust != current.serverTrust { refused.append("serverTrust") }
         return refused
     }
 
@@ -410,7 +413,7 @@ enum SessionOptionCorrection {
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "progressiveSegmentDeliveryAfterSeek", "seekLandsOnKeyframeWhenSlow", "firstSegmentTargetSeconds", "heldSourceMaxBitsPerSecond", "segmentCacheMaxBytes", "sourceDialDelaySeconds", "carryIdentityHeadersAcrossRedirects", "sourceURLRefresher", "ownCloseReleaseSeconds", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "progressiveSegmentDeliveryAfterSeek", "seekLandsOnKeyframeWhenSlow", "firstSegmentTargetSeconds", "heldSourceMaxBitsPerSecond", "segmentCacheMaxBytes", "sourceDialDelaySeconds", "carryIdentityHeadersAcrossRedirects", "sourceURLRefresher", "ownCloseReleaseSeconds", "serverTrust", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]

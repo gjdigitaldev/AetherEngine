@@ -432,6 +432,9 @@ final class NativeAVPlayerHost {
         /// Sent with every asset and segment request. The bypass path carries the origin's auth here, so
         /// a swap that dropped them would re-open the same URL unauthenticated.
         var httpHeaders: [String: String] = [:]
+        /// givo-31: the load's `LoadOptions.serverTrust`, for the engine's own fetches on this session
+        /// (the carriage probe). AVPlayer's requests reach an origin it cannot trust through the relay.
+        var serverTrust: ServerTrustPolicy? = nil
         /// #168 / #293: arm the carriage probe and the ingest reroute for a remote origin.
         var armIngestFallback: Bool = false
         /// #334: the ceiling on silence for a path with no other readiness watchdog.
@@ -582,7 +585,7 @@ final class NativeAVPlayerHost {
         // frame; a healthy stream's watchdog disarms and cancels it, an unjudgeable one has its verdict
         // ready by the time the watchdog arms.
         if armIngestFallback {
-            startCarriageProbe(asset: asset, url: url, httpHeaders: httpHeaders)
+            startCarriageProbe(asset: asset, url: url, httpHeaders: httpHeaders, serverTrust: contract.serverTrust)   // givo-31
         }
         playerItem = item
         let diagnostics = AVPlayerItemDiagnostics(item: item, pool: diagnosticPool, read: diagnosticRead)
@@ -2531,7 +2534,8 @@ final class NativeAVPlayerHost {
     /// not what a per-token connection cap counts, so the playlist stage runs against the mount; a segment
     /// fetch is, so it waits for readyToPlay (see `awaitReadyForDeferredProbe`).
     @MainActor
-    private func startCarriageProbe(asset: AVURLAsset, url: URL, httpHeaders: [String: String]) {
+    private func startCarriageProbe(asset: AVURLAsset, url: URL, httpHeaders: [String: String],
+                                    serverTrust: ServerTrustPolicy?) {
         let sid = sessionID
         carriageProbeTask = Task { @MainActor [weak self] in
             let variants = (try? await asset.load(.variants)) ?? []
@@ -2545,7 +2549,8 @@ final class NativeAVPlayerHost {
                 playlistURL: url,
                 httpHeaders: httpHeaders,
                 advertisesFragmentedMP4OnlyVideo:
-                    RemoteHLSIngestFallback.advertisesFragmentedMP4OnlyVideo(codecs)
+                    RemoteHLSIngestFallback.advertisesFragmentedMP4OnlyVideo(codecs),
+                serverTrust: serverTrust   // givo-31
             )
             guard let self, !Task.isCancelled, self.sessionID == sid else { return }
             switch evidence {
@@ -2573,7 +2578,8 @@ final class NativeAVPlayerHost {
                     break
                 }
                 let verdict = await HLSCarriageProbe.classifyDeferredSegmentHead(
-                    url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: url)
+                    url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: url,
+                    serverTrust: serverTrust)   // givo-31
                 guard !Task.isCancelled, self.sessionID == sid else { return }
                 self.publishCarriageProbeVerdict(verdict, sid: sid, from: "segment PMT")
             }

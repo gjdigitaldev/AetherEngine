@@ -106,6 +106,7 @@ extension AetherEngine {
         var pollsSinceStateLine = 0
         let credentials = Self.liveSubtitleRenditionCredentials(
             headers: loadedOptions.httpHeaders, source: customReader)
+        let renditionSession = Self.renditionSession(for: loadedOptions.serverTrust)   // givo-31
         while !Task.isCancelled {
             guard activeSubtitleTrackIndex == trackID else { return }
             // The source axis can be re-anchored under a running session (a producer seam republishes
@@ -124,7 +125,8 @@ extension AetherEngine {
                 // Audit FEA-104: the fetch and both parses run off the main actor; only the merge and
                 // the publish below are back on it.
                 guard let media = try await Self.fetchLiveSubtitleRenditionPlaylist(
-                    rendition.playlistURL, headers: credentials.headers(for: rendition.playlistURL))
+                    rendition.playlistURL, headers: credentials.headers(for: rendition.playlistURL),
+                    session: renditionSession)
                 else { return }
                 pollInterval = Self.liveSubtitlePollInterval(targetDuration: media.targetDuration)
                 // Anchor the work at the playhead, not at the start of the playlist. A rendition
@@ -148,7 +150,7 @@ extension AetherEngine {
                     else { continue }
                     seen.insert(segment.uri)
                     guard let parsed = await Self.fetchLiveSubtitleRenditionSegment(
-                        url, headers: credentials.headers(for: url)) else { continue }
+                        url, headers: credentials.headers(for: url), session: renditionSession) else { continue }
                     guard activeSubtitleTrackIndex == trackID else { return }
                     let fresh = WebVTTSegmentParser.cues(from: parsed, segmentWallStart: wallStart,
                                                          segmentDuration: segment.duration,
@@ -223,6 +225,12 @@ extension AetherEngine {
     nonisolated static let renditionSession = URLSession(
         configuration: liveSubtitleRenditionSessionConfiguration(),
         delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+
+    /// givo-31: the shared session, or under the load's trust policy the policy's own.
+    nonisolated static func renditionSession(for trust: ServerTrustPolicy?) -> URLSession {
+        trust?.pooledSession("live-subtitle-rendition", configuration: liveSubtitleRenditionSessionConfiguration)
+            ?? renditionSession
+    }
 
     /// One poll of a rendition playlist, fetched under a size cap with its status checked and parsed
     /// off the main actor (audit FEA-104, FEA-107). nil when the URL answers with a master playlist.

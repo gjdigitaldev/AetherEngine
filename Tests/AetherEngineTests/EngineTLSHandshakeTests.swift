@@ -157,6 +157,155 @@
             #expect(server.requestsServed > 0)
         }
 
+        // MARK: givo-31 per-load trust
+
+        @Test("A load's own policy serves the reader with no process-wide hook set")
+        func perLoadPolicyServes() async throws {
+            let server = try #require(await SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous; EngineTLS.serverTrustDecision = nil }
+            EngineTLS.serverTrustEvaluator = nil
+            EngineTLS.serverTrustDecision = nil
+            let port = Int(server.port)
+            let policy = ServerTrustPolicy(decide: { $0.port == port ? .accept : .systemDefault })
+
+            let reader = AVIOReader(
+                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                chunkRequestTimeout: 10, chunkMaxRetries: 2, serverTrust: policy)
+            defer { reader.markClosed(); reader.close() }
+            try reader.open()
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+            defer { buf.deallocate() }
+            #expect(reader.read(into: buf, size: 4096) > 0)
+            #expect(buf[0] == 0xA7)
+            #expect(server.requestsServed > 0)
+        }
+
+        /// The defect this closes: an allowance one session held reached every other connection in the
+        /// process to the same host, warms included, and a pooled connection could carry it too.
+        @Test("Another load's policy is not this one's: a reader with none is refused beside one that is served")
+        func perLoadPolicyStaysWithItsLoad() async throws {
+            let server = try #require(await SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous; EngineTLS.serverTrustDecision = nil }
+            EngineTLS.serverTrustEvaluator = nil
+            EngineTLS.serverTrustDecision = nil
+            let port = Int(server.port)
+            let policy = ServerTrustPolicy(decide: { $0.port == port ? .accept : .systemDefault })
+            let url = URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!
+
+            let accepted = AVIOReader(url: url, chunkRequestTimeout: 10, chunkMaxRetries: 2, serverTrust: policy)
+            defer { accepted.markClosed(); accepted.close() }
+            try accepted.open()
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+            defer { buf.deallocate() }
+            #expect(accepted.read(into: buf, size: 4096) > 0)
+            let servedToAccepted = server.requestsServed
+            #expect(servedToAccepted > 0)
+
+            let other = AVIOReader(url: url, chunkRequestTimeout: 5, chunkMaxRetries: 1)
+            defer { other.markClosed(); other.close() }
+            let refusal = Self.openFailure(of: other)
+            try await Task.sleep(for: .seconds(1))
+            #expect(Self.isTrustRefusal(refusal),
+                    "open failed as \(String(describing: refusal)), not a trust refusal")
+            #expect(server.requestsServed == servedToAccepted,
+                    "a reader with no policy was served while another load's policy accepted the origin")
+        }
+
+        @Test("A load's policy answers alone: its .systemDefault is refused where the process-wide evaluator accepts")
+        func perLoadPolicyIsNotWidenedByProcessWideHooks() async throws {
+            let server = try #require(await SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = { _ in true }
+            let policy = ServerTrustPolicy(decide: { _ in .systemDefault })
+
+            let reader = AVIOReader(
+                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                chunkRequestTimeout: 5, chunkMaxRetries: 1, serverTrust: policy)
+            defer { reader.markClosed(); reader.close() }
+            let refusal = Self.openFailure(of: reader)
+
+            try await Task.sleep(for: .seconds(1))
+            #expect(server.requestsServed == 0, "the process-wide evaluator answered for a load with its own policy")
+            #expect(Self.isTrustRefusal(refusal),
+                    "open failed as \(String(describing: refusal)), not a trust refusal")
+        }
+
+        @Test("A held connection asks its load's own policy")
+        func heldConnectionUnderItsOwnPolicy() async throws {
+            let server = try #require(await SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous; EngineTLS.serverTrustDecision = nil }
+            EngineTLS.serverTrustEvaluator = nil
+            EngineTLS.serverTrustDecision = nil
+            let port = Int(server.port)
+            let policy = ServerTrustPolicy(decide: { $0.port == port ? .accept : .systemDefault })
+
+            let reader = AVIOReader(
+                url: URL(string: "https://127.0.0.1:\(server.port)/held.bin")!,
+                chunkRequestTimeout: 10, chunkMaxRetries: 2, heldConnection: true, serverTrust: policy)
+            defer { reader.markClosed(); reader.close() }
+            try reader.open()
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+            defer { buf.deallocate() }
+            #expect(reader.read(into: buf, size: 4096) > 0)
+            #expect(buf[0] == 0xA7)
+        }
+
+        @Test("Through the relay: a load's own policy is what the relay's handshake asks")
+        func relayAsksItsLoadsPolicy() async throws {
+            let origin = try #require(await SelfSignedHLSOrigin())
+            defer { origin.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous; EngineTLS.serverTrustDecision = nil }
+            EngineTLS.serverTrustEvaluator = nil
+            EngineTLS.serverTrustDecision = nil
+            let port = Int(origin.port)
+            let policy = ServerTrustPolicy(decide: { $0.port == port ? .accept : .systemDefault })
+
+            let server = HLSLocalServer(relay: HLSOriginRelay(serverTrust: policy))
+            try server.start()
+            defer { server.stop(); server.relay?.stop() }
+
+            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
+            let entry = try #require(server.relayURL(for: master))
+            let playlist = try await Self.text(of: entry)
+            #expect(playlist.contains("#EXT-X-STREAM-INF"))
+        }
+
+        @Test("A warm under its own policy is served; the same warm under none is declined")
+        func prewarmUnderItsOwnPolicy() async throws {
+            let server = try #require(await SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous; EngineTLS.serverTrustDecision = nil }
+            EngineTLS.serverTrustEvaluator = nil
+            EngineTLS.serverTrustDecision = nil
+            let port = Int(server.port)
+            let policy = ServerTrustPolicy(decide: { $0.port == port ? .accept : .systemDefault })
+            let store = SourcePrewarmStore()
+            let url = URL(string: "https://127.0.0.1:\(server.port)/warm.bin")!
+
+            let refused = await SourcePrewarmFetcher.warm(url: url, extraHeaders: [:], byteBudget: 64 * 1024,
+                                                          into: store)
+            #expect(!refused.isWarm, "a warm with no policy crossed a handshake system trust refuses")
+            let warmed = await SourcePrewarmFetcher.warm(url: url, extraHeaders: [:], byteBudget: 64 * 1024,
+                                                         serverTrust: policy, into: store)
+            #expect(warmed.isWarm, "the warm's own policy did not reach its request: \(warmed.declined ?? "-")")
+        }
+
         @Test("Through the relay: a client that never sees the certificate gets the stream")
         func relayServesThroughUntrustedOrigin() async throws {
             let origin = try #require(await SelfSignedHLSOrigin())

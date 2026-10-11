@@ -2495,6 +2495,8 @@ public final class AetherEngine: ObservableObject {
         let url: URL
         let headers: [String: String]
         let targets: [Target]
+        /// givo-31: the session's `LoadOptions.serverTrust`.
+        var serverTrust: ServerTrustPolicy? = nil
     }
 
     /// Native WebVTT rendition store for the in-band CEA-608 track (#98). The CC tap feeds it (via
@@ -4020,7 +4022,8 @@ public final class AetherEngine: ObservableObject {
     ) async throws -> HLSVODIngestReroute {
         let verdict = try await HLSVODIngestReader.rerouteVerdict(
             playlistURL: playlistURL,
-            httpHeaders: options.httpHeaders
+            httpHeaders: options.httpHeaders,
+            serverTrust: options.serverTrust   // givo-31
         )
         try checkLoadCurrent(generation)
         let reader: HLSVODIngestReader
@@ -4226,7 +4229,8 @@ public final class AetherEngine: ObservableObject {
             )
             options.nativeRemoteHLS = false
             source = .custom(
-                HLSLiveIngestReader(playlistURL: candidate, httpHeaders: options.httpHeaders),
+                HLSLiveIngestReader(playlistURL: candidate, httpHeaders: options.httpHeaders,
+                                    serverTrust: options.serverTrust),   // givo-31
                 formatHint: "mpegts"
             )
         }
@@ -4524,7 +4528,8 @@ public final class AetherEngine: ObservableObject {
             return try await load(
                 source: .custom(
                     HLSLiveIngestReader(playlistURL: livePlaylistURL,
-                                        httpHeaders: loadedOptions.httpHeaders),
+                                        httpHeaders: loadedOptions.httpHeaders,
+                                        serverTrust: loadedOptions.serverTrust),   // givo-31
                     formatHint: "mpegts"
                 ),
                 startPosition: startPosition,
@@ -4565,6 +4570,7 @@ public final class AetherEngine: ObservableObject {
                                           declaredDuration: options.declaredDurationSeconds)
                     .withHeldSourceConnection(options.heldSourceConnection)
                     .withSourceOpenPolicy(options.sourceOpenPolicy)
+                    .withServerTrust(options.serverTrust)   // givo-31
                 switch source {
                 case .url(let u):
                     // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
@@ -4606,8 +4612,10 @@ public final class AetherEngine: ObservableObject {
                        colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                        colorMatrix: stream.pointee.codecpar.pointee.color_space) {
                     let auditHeaders = options.httpHeaders
+                    let auditTrust = options.serverTrust   // givo-31
                     detectedDVRPUProfile = await BlockingWork.detached(priority: .userInitiated) {
-                        DolbyVisionRecordAudit.rpuProfileOfSource(url: auditURL, extraHeaders: auditHeaders)
+                        DolbyVisionRecordAudit.rpuProfileOfSource(url: auditURL, extraHeaders: auditHeaders,
+                                                                  serverTrust: auditTrust)
                     }.value
                     correctedDVProfile = DolbyVisionRecordAudit.correctedProfile(
                         record: detectedDVProfileNum, rpu: detectedDVRPUProfile)
@@ -4719,7 +4727,8 @@ public final class AetherEngine: ObservableObject {
             return try await load(
                 source: .custom(
                     HLSLiveIngestReader(playlistURL: livePlaylistURL,
-                                        httpHeaders: loadedOptions.httpHeaders),
+                                        httpHeaders: loadedOptions.httpHeaders,
+                                        serverTrust: loadedOptions.serverTrust),   // givo-31
                     formatHint: "mpegts"
                 ),
                 startPosition: startPosition,

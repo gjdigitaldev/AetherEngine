@@ -43,14 +43,15 @@ final class ProbeHTTPReader: IOReader, @unchecked Sendable {
     let discImageProbeEnabled: Bool
 
     init(url: URL, headers: [String: String], control: ProbeControl,
-         boundedWindowBytes: Int? = nil) {
+         boundedWindowBytes: Int? = nil, serverTrust: ServerTrustPolicy? = nil) {
         discImageProbeEnabled = Demuxer.isDiscImageURL(url)
         reader = AVIOReader(
             url: url, extraHeaders: headers, label: "probe",
             chunkSize: 64 * 1024, prefetchEnabled: false,
             chunkRequestTimeout: 2, chunkMaxRetries: 1,
             boundedInitialFetch: boundedWindowBytes.map { Int64($0) },
-            windowHighWater: boundedWindowBytes, probeControl: control)
+            windowHighWater: boundedWindowBytes, probeControl: control,
+            serverTrust: serverTrust)   // givo-31
     }
 
     func open() throws { try reader.open() }

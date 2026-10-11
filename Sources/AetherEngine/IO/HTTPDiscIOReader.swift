@@ -24,6 +24,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     private let url: URL
     private let extraHeaders: [String: String]
     private let session: URLSession
+    /// givo-31: the load's trust policy; a fork's own session is opened under it too.
+    private let serverTrust: ServerTrustPolicy?
     private let requestTimeout: TimeInterval
     private let baseChunkSize: Int
     private let maxChunkSize: Int
@@ -65,8 +67,9 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                       maxRetries: Int = 3,
                       requestTimeout: TimeInterval = 30,
                       sessionConfiguration: URLSessionConfiguration? = nil,
-                      prewarmed: PrewarmedSource? = nil) {
-        let session = Self.makeSession(sessionConfiguration)
+                      prewarmed: PrewarmedSource? = nil,
+                      serverTrust: ServerTrustPolicy? = nil) {
+        let session = Self.makeSession(sessionConfiguration, trust: serverTrust)   // givo-31
         guard case .size(let size) = Self.resolveSize(
             url: url, extraHeaders: extraHeaders, session: session, requestTimeout: requestTimeout,
             maxRetries: maxRetries, knownSize: prewarmed?.contentLength) else {
@@ -75,7 +78,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         }
         self.init(url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
                   maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
-                  session: session, totalSize: size,
+                  session: session, serverTrust: serverTrust, totalSize: size,
                   residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [])
     }
 
@@ -90,8 +93,9 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                      maxRetries: Int = 3,
                      requestTimeout: TimeInterval = 30,
                      sessionConfiguration: URLSessionConfiguration? = nil,
-                     prewarmed: PrewarmedSource? = nil) throws -> HTTPDiscIOReader? {
-        let session = makeSession(sessionConfiguration)
+                     prewarmed: PrewarmedSource? = nil,
+                     serverTrust: ServerTrustPolicy? = nil) throws -> HTTPDiscIOReader? {
+        let session = makeSession(sessionConfiguration, trust: serverTrust)   // givo-31
         switch resolveSize(url: url, extraHeaders: extraHeaders, session: session,
                            requestTimeout: requestTimeout, maxRetries: maxRetries,
                            knownSize: prewarmed?.contentLength) {
@@ -99,7 +103,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             return HTTPDiscIOReader(
                 url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
                 maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
-                session: session, totalSize: size,
+                session: session, serverTrust: serverTrust, totalSize: size,
                 residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [])
         case .ignoresRange:
             session.invalidateAndCancel()
@@ -117,8 +121,10 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                  maxRetries: Int,
                  requestTimeout: TimeInterval,
                  session: URLSession,
+                 serverTrust: ServerTrustPolicy?,
                  totalSize: Int64,
                  residentSpans: [ResidentSpan]) {
+        self.serverTrust = serverTrust   // givo-31
         self.url = url
         self.extraHeaders = extraHeaders
         self.baseChunkSize = max(64 * 1024, baseChunkSize)
@@ -131,13 +137,14 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.totalSize = totalSize
     }
 
-    private static func makeSession(_ sessionConfiguration: URLSessionConfiguration?) -> URLSession {
+    private static func makeSession(_ sessionConfiguration: URLSessionConfiguration?,
+                                    trust: ServerTrustPolicy?) -> URLSession {
         let config = sessionConfiguration ?? {
             let c = URLSessionConfiguration.ephemeral
             c.requestCachePolicy = .reloadIgnoringLocalCacheData
             return c
         }()
-        return URLSession(configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+        return URLSession(configuration: config, delegate: EngineTLS.sessionDelegate(for: trust), delegateQueue: nil)   // givo-31
     }
 
     /// `knownSize` skips the range probe. Only a source that has already answered a range request
@@ -276,7 +283,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         HTTPDiscIOReader(url: url, extraHeaders: extraHeaders,
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
                          maxRetries: maxRetries, requestTimeout: requestTimeout,
-                         session: Self.makeSession(nil),
+                         session: Self.makeSession(nil, trust: serverTrust), serverTrust: serverTrust,   // givo-31
                          totalSize: totalSize, residentSpans: residentSpans)
     }
 
@@ -459,7 +466,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, on: session, completionHandler: completionHandler)   // givo-31
     }
 
     func urlSession(

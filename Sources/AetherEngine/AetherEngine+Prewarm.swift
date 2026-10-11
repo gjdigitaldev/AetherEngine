@@ -45,14 +45,19 @@ public extension AetherEngine {
     ///     origins that enforce Referer / User-Agent / Authorization.
     ///   - byteBudget: How many bytes to retain from the head. Defaults to
     ///     ``defaultPrewarmByteBudget``.
+    ///   - serverTrust: givo-31: the warm's own answer to server certificates (`ServerTrustPolicy`),
+    ///     asked by its requests instead of `EngineTLS`'s process-wide hooks, in a URL session of the
+    ///     policy's own. nil (the default) keeps the process-wide hooks.
     /// - Returns: A ``SourcePrewarmReport`` naming what was retained, or why nothing was.
     @discardableResult
     nonisolated static func prewarm(url: URL,
                                     httpHeaders: [String: String] = [:],
-                                    byteBudget: Int? = nil) async -> SourcePrewarmReport {
+                                    byteBudget: Int? = nil,
+                                    serverTrust: ServerTrustPolicy? = nil) async -> SourcePrewarmReport {
         await SourcePrewarmFetcher.warm(url: url,
                                         extraHeaders: httpHeaders,
-                                        byteBudget: byteBudget ?? SourcePrewarmFetcher.defaultByteBudget)
+                                        byteBudget: byteBudget ?? SourcePrewarmFetcher.defaultByteBudget,
+                                        serverTrust: serverTrust)   // givo-31
     }
 
     /// Whether a source is warm right now, without consuming it.

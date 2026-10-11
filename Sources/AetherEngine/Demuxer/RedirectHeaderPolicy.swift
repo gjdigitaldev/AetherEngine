@@ -75,14 +75,22 @@ enum RedirectHeaderPolicy {
     /// the target is not credential-worthy. URLSession's default redirect copies every custom
     /// header except `Authorization` to the new host (measured on CFNetwork 3896, audit
     /// NET-108), so the scrub is what keeps a token and a cookie off a cross-origin target.
+    ///
+    /// givo-31: `trust` is the policy the request was made under; the hop is reported to it, or to the
+    /// process-wide `EngineTLS.redirectObserver` for a request made under none. `reportsHop` false
+    /// reports it nowhere (a policy's session whose policy is gone).
     static func redirectRequest(
         _ request: URLRequest,
         originalURL: URL?,
         originalRange: String?,
-        extraHeaders: [String: String]
+        extraHeaders: [String: String],
+        trust: ServerTrustPolicy? = nil,
+        reportsHop: Bool = true
     ) -> URLRequest {
         // givo-10: every redirect the engine follows passes here, before the hop is requested.
-        if let target = request.url { EngineTLS.redirectObserver?(originalURL, target) }
+        if reportsHop, let target = request.url {
+            EngineTLS.noteRedirect(from: originalURL, to: target, trust: trust)   // givo-31
+        }
         var updated = request
         if let originalRange {
             updated.setValue(originalRange, forHTTPHeaderField: "Range")

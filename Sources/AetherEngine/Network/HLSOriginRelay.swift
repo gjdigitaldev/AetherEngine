@@ -84,8 +84,11 @@ final class HLSOriginRelay: @unchecked Sendable {
     }
     private var _cappedFetchCount = 0
 
+    /// givo-31: `serverTrust` is the session's `LoadOptions.serverTrust`; the relay's fetches ask it,
+    /// and nothing else, about the origin's certificate. nil keeps the process-wide hooks.
     init(maximumHeldBodyBytes: Int = HLSOriginRelay.maximumHeldBodyBytes,
-         maximumPendingBytes: Int = HLSOriginRelay.maximumPendingBytes) {
+         maximumPendingBytes: Int = HLSOriginRelay.maximumPendingBytes,
+         serverTrust: ServerTrustPolicy? = nil) {
         heldBodyLimit = maximumHeldBodyBytes
         pendingLimit = maximumPendingBytes
         let config = URLSessionConfiguration.ephemeral
@@ -94,7 +97,7 @@ final class HLSOriginRelay: @unchecked Sendable {
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 120
         session = URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+            configuration: config, delegate: EngineTLS.sessionDelegate(for: serverTrust), delegateQueue: nil)   // givo-31
     }
 
     func stop() {
@@ -117,7 +120,8 @@ final class HLSOriginRelay: @unchecked Sendable {
     /// not the second, and either way the handshake is what is being read. Anything that is not a
     /// trust refusal, an unreachable host, a timeout, a 500, answers false: those fail the load on the
     /// direct route too, and a relay would not save them.
-    static func systemTrustRefuses(_ origin: URL, headers: [String: String] = [:]) async -> Bool {
+    static func systemTrustRefuses(_ origin: URL, headers: [String: String] = [:],
+                                   serverTrust: ServerTrustPolicy? = nil) async -> Bool {
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
@@ -127,8 +131,9 @@ final class HLSOriginRelay: @unchecked Sendable {
         // does, which is system trust and nothing else; handing it `EngineTLS.sessionDelegate` would
         // ask the host and get back the answer that hides what is being measured. The redirect rule
         // still applies (audit NET-108).
+        // givo-31: a hop it follows is reported to the session's own policy.
         let session = URLSession(
-            configuration: config, delegate: EngineTLS.redirectDelegate, delegateQueue: nil)
+            configuration: config, delegate: EngineTLS.redirectDelegate(for: serverTrust), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
 
         var request = URLRequest(url: origin)
@@ -742,6 +747,6 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         _ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
+        EngineTLS.resolve(challenge, on: session, completionHandler: completionHandler)   // givo-31: the relay's session's policy
     }
 }

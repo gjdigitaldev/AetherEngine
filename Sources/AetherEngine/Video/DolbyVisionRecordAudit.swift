@@ -133,7 +133,8 @@ public enum DolbyVisionRecordAudit {
     /// same stream and none of them needs the verdict carried to it. A failed read is no evidence.
     @discardableResult
     static func addRecordIfProfile5(
-        codecpar: UnsafeMutablePointer<AVCodecParameters>, url: URL, extraHeaders: [String: String]
+        codecpar: UnsafeMutablePointer<AVCodecParameters>, url: URL, extraHeaders: [String: String],
+        serverTrust: ServerTrustPolicy? = nil   // givo-31
     ) -> Bool {
         let hasRecord = (0..<Int(codecpar.pointee.nb_coded_side_data)).contains {
             codecpar.pointee.coded_side_data?[$0].type == AV_PKT_DATA_DOVI_CONF
@@ -144,7 +145,7 @@ public enum DolbyVisionRecordAudit {
             colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space,
             colorPrimaries: codecpar.pointee.color_primaries) else { return false }
         let rpu = rpuProfileOfSource(
-            url: url, extraHeaders: extraHeaders, packetBudget: recordlessPacketBudget)
+            url: url, extraHeaders: extraHeaders, serverTrust: serverTrust, packetBudget: recordlessPacketBudget)
         guard rpuProvesProfile5(rpu), synthesizeProfile5Record(codecpar) else {
             EngineLog.emit(
                 "[AetherEngine] AE#recordless: untagged 10-bit HEVC with no DV record, RPU "
@@ -180,14 +181,16 @@ public enum DolbyVisionRecordAudit {
     /// path never sees. The audit is gated on `recordIsContradicted`, so this cost is paid by the one
     /// class of source that is already broken without it, and by no other.
     static func rpuProfileOfSource(
-        url: URL, extraHeaders: [String: String], packetBudget: Int = auditPacketBudget
+        url: URL, extraHeaders: [String: String], serverTrust: ServerTrustPolicy? = nil,   // givo-31
+        packetBudget: Int = auditPacketBudget
     ) -> Int? {
         let demuxer = Demuxer()
         defer { demuxer.close() }
         do {
             try demuxer.open(
                 url: url, extraHeaders: extraHeaders,
-                profile: .dolbyVisionRecordAuditDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+                profile: .dolbyVisionRecordAuditDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil)
+                    .withServerTrust(serverTrust))   // givo-31
         } catch {
             return nil
         }

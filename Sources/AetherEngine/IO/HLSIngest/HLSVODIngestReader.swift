@@ -48,10 +48,13 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// any byte was consumed, resolve without refetching it.
     private var producerStartIndex: Int?
 
+    /// givo-31: `serverTrust` (the load's `LoadOptions.serverTrust`) answers for the session this reader
+    /// opens itself; a caller's own `session` carries its own delegate.
     init(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) {
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
@@ -65,7 +68,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             configuration.urlCache = nil
             self.session = URLSession(
-                configuration: configuration, delegate: EngineTLS.sessionDelegate,
+                configuration: configuration, delegate: EngineTLS.sessionDelegate(for: serverTrust),   // givo-31
                 delegateQueue: nil)
             ownsSession = true
         }
@@ -77,12 +80,14 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     static func makeIfHEVCMPEGTS(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) async throws -> HLSVODIngestReader? {
         let reader = HLSVODIngestReader(
             playlistURL: playlistURL,
             httpHeaders: httpHeaders,
-            session: session
+            session: session,
+            serverTrust: serverTrust   // givo-31
         )
         var accepted = false
         defer {
@@ -136,9 +141,11 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     static func rerouteVerdict(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) async throws -> RerouteVerdict {
-        let reader = HLSVODIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, session: session)
+        let reader = HLSVODIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, session: session,
+                                        serverTrust: serverTrust)   // givo-31
         var accepted = false
         defer {
             if !accepted { reader.close() }
@@ -209,9 +216,11 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     static func makeForIngestRetry(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        serverTrust: ServerTrustPolicy? = nil
     ) async throws -> HLSVODIngestReader? {
-        let reader = HLSVODIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, session: session)
+        let reader = HLSVODIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, session: session,
+                                        serverTrust: serverTrust)   // givo-31
         do {
             let media = try await reader.resolveMedia()
             reader.condition.withLock { reader.resolved = media }

@@ -3825,7 +3825,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// is nothing to act on: live, no recorded reach for the landing segment, a random-access point
     /// already within reach below the target, or a re-cut whose gate did not open in time.
     func preparedSeekLanding(itemSeconds: Double) -> Double {
-        guard !isLiveSession, let provider else { return itemSeconds }
+        // givo-34: a sequential origin has no restart to re-cut with: `requestRestart` refuses it and
+        // surfaces a source failure, which ended a backward seek inside the cache as a network error.
+        guard !isLiveSession, !sequentialOriginPinsProducerToZero, let provider else { return itemSeconds }
         dropUnstartedRecut()
         let index = segmentIndexForPlaylistTime(itemSeconds)
         guard let reach = provider.videoReach(at: index) else { return itemSeconds }

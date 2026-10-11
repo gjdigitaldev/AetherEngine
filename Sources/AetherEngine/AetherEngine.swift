@@ -479,6 +479,13 @@ public final class AetherEngine: ObservableObject {
         return resident.contains { target >= $0.lowerBound && target <= $0.upperBound - 0.5 }
     }
 
+    /// givo-34: whether AVPlayer can seek to `target` (display axis) inside the item's seekable range,
+    /// half a second inside its end; an item with no range yet reaches nothing.
+    nonisolated static func sequentialSeekIsWithinItemReach(target: Double, reach: ClosedRange<Double>) -> Bool {
+        guard target.isFinite, reach.upperBound > reach.lowerBound else { return false }
+        return target >= reach.lowerBound && target <= reach.upperBound - 0.5
+    }
+
     /// Rejection path: the seek never reached a host, so it gets a standalone event and no `.began`.
     func emitSeekRejected(_ reason: SeekEvent.Rejection, target: Double) {
         emitSeekEvent(id: nextSeekEventID(), origin: .programmatic, outcome: .rejected(reason), target: target)
@@ -1015,6 +1022,11 @@ public final class AetherEngine: ObservableObject {
         var origin: SeekOrigin
     }
     var pendingPreReadySeek: PendingPreReadySeek?
+    /// givo-34: the native mount of a sequential origin queued its post-readiness seek to the item's
+    /// start (AVPlayer otherwise starts a growing playlist at its edge minus holdback). That one seek is
+    /// always reachable (the first segment was just fetched), so it skips the givo-15 resident gate,
+    /// which read an empty band at readiness and refused it. Consumed by the seek, cleared by a load.
+    var sequentialMountSeekArmed = false
     /// AE#446 round 4: what separates the CURRENT item's own timeline from the session's, in seconds.
     ///
     /// AVPlayer places a live playlist's content by the PLAYLIST, so an item's zero is the first
@@ -5815,10 +5827,32 @@ public final class AetherEngine: ObservableObject {
         }
         // givo-15: a sequential origin cannot reopen past byte 0, but it keeps every segment it cut, so
         // a target inside what the session already read lands from the cache on the native route.
-        let residentSequentialSeek = !isLive && loadedOptions.sequentialOrigin
+        let sequentialNative = !isLive && loadedOptions.sequentialOrigin
             && nativeHost != nil && softwareHost == nil && audioHost == nil
+        // givo-34: the mount's own start (see `sequentialMountSeekArmed`).
+        let mountStartSeek = sequentialNative && sequentialMountSeekArmed && seconds <= 0.001
+        sequentialMountSeekArmed = false
+        // givo-34: cached is not enough. AVPlayer reads the growing playlist as a live one and can seek
+        // only inside the seekable range of its last reload, which trails what the producer has cut
+        // (by seconds, more right after a mount on a fast origin), and a seek past it never lands.
+        let itemReach = nativeHost.map { host in
+            displaySeconds(forPlaylistSeconds: host.seekableStart)...displaySeconds(forPlaylistSeconds: max(host.seekableStart, host.seekableEnd))
+        }
+        let cachedSequentialSeek = sequentialNative
             && Self.sequentialSeekIsResident(target: seconds, resident: residentRanges)
-        if residentSequentialSeek {
+        let withinItemReach = itemReach.map { Self.sequentialSeekIsWithinItemReach(target: seconds, reach: $0) } ?? false
+        if cachedSequentialSeek, !withinItemReach, !mountStartSeek {
+            EngineLog.emit("[AetherEngine] seek(to:\(String(format: "%.2f", seconds))) on a sequential origin is cached "
+                           + "but past what the item can seek yet (seekable \(itemReach.map { String(format: "%.2f-%.2f", $0.lowerBound, $0.upperBound) } ?? "none")s); "
+                           + "refused, a host can reopen there (givo-34)", category: .engine)
+            emitSeekRejected(.sourceNotSeekable, target: seconds)
+            return
+        }
+        let residentSequentialSeek = mountStartSeek || (cachedSequentialSeek && withinItemReach)
+        if mountStartSeek {
+            EngineLog.emit("[AetherEngine] seek to the start of a sequential mount; the first segment is always "
+                           + "retained (givo-34)", category: .engine)
+        } else if residentSequentialSeek {
             EngineLog.emit("[AetherEngine] seek(to:\(String(format: "%.2f", seconds))) on a sequential origin lands "
                            + "inside what the session already read; served from the cache (givo-15)", category: .engine)
         }
@@ -6178,7 +6212,7 @@ public final class AetherEngine: ObservableObject {
                     closeSeekTicket(&programmaticSeekTicket,
                                     with: .landed(renderedTime: PresentationAxis.display(
                                         sourcePTS: avpReal + playlistShiftSeconds,
-                                        origin: sourcePresentationOrigin)))
+                                        origin: displayOrigin(forShift: playlistShiftSeconds))))   // givo-34: the item axis on a sequential origin
                     reconcileNativeSeekTransport(host: host, isStarved: false)
                     EngineLog.emit(
                         "[AetherEngine] seek landed while deadline ownership transferred; "
@@ -6461,8 +6495,13 @@ public final class AetherEngine: ObservableObject {
         closeSeekTicket(&programmaticSeekTicket,
                         with: Self.seekTicketOutcome(
                             hostReposition: hostReposition,
-                            renderedTime: PresentationAxis.display(sourcePTS: clock.sourceTime,
-                                                                   origin: sourcePresentationOrigin)))
+                            // givo-34: on a sequential origin `sourceTime` is already the item axis
+                            // (#368), so no origin comes off it (a mount starting 253 s in reported a
+                            // landing at item 210 s as -43 s).
+                            renderedTime: displayAxisIsItemAxis
+                                ? clock.sourceTime
+                                : PresentationAxis.display(sourcePTS: clock.sourceTime,
+                                                           origin: sourcePresentationOrigin)))
     }
 
     /// #254: how a SW/audio-host reposition maps onto this seek's ticket. A reposition that spent its
@@ -6632,6 +6671,10 @@ public final class AetherEngine: ObservableObject {
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         registerCarriedIdentityHeaders([], source: nil)   // givo-16
         registerSourceURLRefresher(nil, source: nil)   // givo-20
+        // givo-34: a stopped session holds no trust policy: the policy (and the URL sessions it owns)
+        // goes with the load that stopped. A reload of the same title is a new load that brings its own.
+        loadedOptions.serverTrust = nil
+        sequentialMountSeekArmed = false
         closedSourceKeptNativeItem = false   // givo-18
         cancelPendingAudioSelection()
         releaseHeldPicture(reason: "stop")

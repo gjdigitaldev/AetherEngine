@@ -1856,6 +1856,7 @@ extension AetherEngine {
         // item on the EVENT edge default would start it mid-archive with no way back.
         if !isLive, loadedOptions.sequentialOrigin {
             pendingPreReadySeek = PendingPreReadySeek(seconds: 0.0, origin: .host)
+            sequentialMountSeekArmed = true   // givo-34
         }
         // AE#158: consume-and-reset so only the load() that armed the handover swaps in place; audio-switch
         // and recovery reloads keep their own contracts.

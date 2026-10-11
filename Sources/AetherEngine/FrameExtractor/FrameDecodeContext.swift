@@ -14,6 +14,8 @@ import AetherLibswscale
 final class FrameDecodeContext: @unchecked Sendable {
     private let url: URL
     private let httpHeaders: [String: String]
+    /// givo-33: the session's trust policy, for the extractor's own connections (nil: the process-wide hooks).
+    private let serverTrust: ServerTrustPolicy?
     /// When non-nil, opens from this independent reader (custom source clone) not the URL.
     /// Closed at deinit, NOT in close() (which tears down only demuxer/decoder so the
     /// idle-reopen path can rebuild over the still-alive reader).
@@ -124,9 +126,10 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 
     init(url: URL, httpHeaders: [String: String], selectTitleID: Int? = nil,
-         allowsHardwareDecode: Bool = false) {
+         allowsHardwareDecode: Bool = false, serverTrust: ServerTrustPolicy? = nil) {
         self.url = url
         self.httpHeaders = httpHeaders
+        self.serverTrust = serverTrust   // givo-33
         self.reader = nil
         self.formatHint = nil
         self.selectTitleID = selectTitleID
@@ -137,6 +140,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         // Placeholder; unused when reader != nil (openInternal opens the reader).
         self.url = URL(string: "aether-custom://frame-extractor")!
         self.httpHeaders = [:]
+        self.serverTrust = nil
         self.reader = reader
         self.formatHint = formatHint
         self.selectTitleID = nil
@@ -202,7 +206,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                 boundedReader = file
             } else if ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
                 let http = ProbeHTTPReader(url: url, headers: httpHeaders, control: control,
-                                           boundedWindowBytes: 64 * 1024)
+                                           boundedWindowBytes: 64 * 1024, serverTrust: serverTrust)   // givo-33
                 source = http
                 boundedReader = http
             } else {
@@ -223,7 +227,9 @@ final class FrameDecodeContext: @unchecked Sendable {
         } else if let reader = reader {
             try demuxer.open(reader: reader, formatHint: formatHint, profile: .stillExtraction)
         } else {
-            try demuxer.open(url: url, extraHeaders: httpHeaders, profile: .stillExtraction, selectTitleID: selectTitleID)
+            try demuxer.open(url: url, extraHeaders: httpHeaders,
+                             profile: DemuxerOpenProfile.stillExtraction.withServerTrust(serverTrust),   // givo-33
+                             selectTitleID: selectTitleID)
         }
         self.demuxer = demuxer
 

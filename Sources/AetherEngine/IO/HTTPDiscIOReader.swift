@@ -163,6 +163,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// turns out not to be a disc puts them back (`SourcePrewarmStore.store`) so the streaming
     /// reader it falls back to adopts them instead.
     static func takePrewarm(for url: URL, extraHeaders: [String: String],
+                            serverTrust: ServerTrustPolicy? = nil,
                             store: SourcePrewarmStore = .shared) -> PrewarmedSource? {
         guard let warm = store.take(for: url) else { return nil }
         guard warm.head.start == 0, !warm.head.isEmpty, warm.contentLength > 0 else { return nil }
@@ -170,6 +171,13 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             EngineLog.emit(
                 "[HTTPDiscIOReader] \(url.lastPathComponent): a warm exists for this URL but was "
                 + "fetched with different headers; opening cold (#647)", category: .demux)
+            return nil
+        }
+        // givo-33: bytes fetched under another trust policy are not this load's to trust.
+        guard ServerTrustPolicy.answersAlike(warm.trust, serverTrust) else {
+            EngineLog.emit(
+                "[HTTPDiscIOReader] \(url.lastPathComponent): a warm exists for this URL but was "
+                + "fetched under another trust policy; opening cold (givo-33)", category: .demux)
             return nil
         }
         EngineLog.emit(

@@ -302,6 +302,35 @@ public final class ServerTrustPolicy: @unchecked Sendable, Equatable {
     private let decide: @Sendable (URLProtectionSpace) -> EngineTLS.ServerTrustDecision
     private let onRedirect: (@Sendable (_ original: URL?, _ target: URL) -> Void)?
 
+    /// givo-33: a host's name for what this policy accepts. Two policies with the same non-nil
+    /// `identity` answer alike, so bytes a warm fetched under one may be adopted by a load under the
+    /// other; nil (the default) matches this policy object only. Never logged.
+    public let identity: String?
+    private let stampID = UUID()
+
+    /// givo-33: what a warm records of the policy it was fetched under (no reference to the policy, so a
+    /// stored warm does not keep its sessions alive).
+    struct Stamp: Sendable, Equatable {
+        let id: UUID
+        let identity: String?
+    }
+
+    var stamp: Stamp { Stamp(id: stampID, identity: identity) }
+
+    /// givo-33: whether bytes fetched under `stamp` (nil: under no policy) may be adopted by a load under
+    /// `policy`. No policy matches only no policy; a policy matches itself or a policy of the same
+    /// non-nil `identity`.
+    static func answersAlike(_ stamp: Stamp?, _ policy: ServerTrustPolicy?) -> Bool {
+        switch (stamp, policy) {
+        case (nil, nil):
+            return true
+        case let (stamp?, policy?):
+            return stamp.id == policy.stampID || (stamp.identity != nil && stamp.identity == policy.identity)
+        default:
+            return false
+        }
+    }
+
     /// The delegate every session opened under this policy carries.
     let sessionDelegate: EngineTLS.SessionTrustDelegate
 
@@ -318,10 +347,13 @@ public final class ServerTrustPolicy: @unchecked Sendable, Equatable {
     ///     made under this policy is about to follow, before the hop is requested, so `decide` can
     ///     answer for the hosts this load's source redirects to and for no other load's. Same
     ///     threading rules.
+    ///   - identity: givo-33: see `identity`.
     public init(decide: @escaping @Sendable (URLProtectionSpace) -> EngineTLS.ServerTrustDecision,
-                onRedirect: (@Sendable (_ original: URL?, _ target: URL) -> Void)? = nil) {
+                onRedirect: (@Sendable (_ original: URL?, _ target: URL) -> Void)? = nil,
+                identity: String? = nil) {
         self.decide = decide
         self.onRedirect = onRedirect
+        self.identity = identity
         self.sessionDelegate = EngineTLS.SessionTrustDelegate(unboundPolicy: ())
         sessionDelegate.bind(self)
     }

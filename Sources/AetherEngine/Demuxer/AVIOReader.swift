@@ -3221,6 +3221,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 + "headers; opening cold (#551)", category: .demux)
             return nil
         }
+        // givo-33: bytes fetched over a connection another policy accepted are not this load's to trust.
+        guard ServerTrustPolicy.answersAlike(warm.trust, serverTrust) else {
+            EngineLog.emit(
+                "[AVIOReader] \(label) a warm exists for this URL but was fetched under another trust "
+                + "policy; opening cold (givo-33)", category: .demux)
+            return nil
+        }
         winCond.lock()
         headSpan = warm.head.data
         if let tail = warm.tail { tailSpan = tail }
@@ -3235,6 +3242,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // expiry ladder above handles a lease that has run out in the usual way: drop it and
         // re-resolve through the source URL. Credential headers do not follow it (`headers(for:)`).
         recordResolvedURL(warm.resolvedURL)
+        // givo-33: the warm followed that hop, this load did not: its policy learns it before any
+        // request of the load reaches the target.
+        if let resolved = warm.resolvedURL, resolved != url {
+            EngineTLS.noteRedirect(from: url, to: resolved, trust: serverTrust)
+        }
         EngineLog.emit(
             "[AVIOReader] \(label) adopted a prewarmed source: head=\(warm.head.data.count)B "
             + "tail=\(warm.tail?.data.count ?? 0)B of \(warm.contentLength)B; "

@@ -107,10 +107,15 @@ public actor FrameExtractor {
     /// `selectTitleID` picks the disc title for a Blu-ray / DVD ISO URL (nil = main title); it lets a
     /// still follow the currently-selected title instead of always the default one (AE#105). Inert for
     /// non-disc URLs.
+    ///
+    /// givo-33: `serverTrust` is the trust policy the extractor's connections ask (`ServerTrustPolicy`);
+    /// nil keeps `EngineTLS`'s process-wide hooks.
     public init(url: URL, httpHeaders: [String: String] = [:],
                 selectTitleID: Int? = nil,
+                serverTrust: ServerTrustPolicy? = nil,
                 yieldWhile: (@Sendable () -> Bool)? = nil) {
-        self.init(context: FrameDecodeContext(url: url, httpHeaders: httpHeaders, selectTitleID: selectTitleID),
+        self.init(context: FrameDecodeContext(url: url, httpHeaders: httpHeaders, selectTitleID: selectTitleID,
+                                              serverTrust: serverTrust),
                   yieldWhile: yieldWhile)
     }
 

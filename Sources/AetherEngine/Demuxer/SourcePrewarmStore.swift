@@ -28,6 +28,10 @@ struct PrewarmedSource: Sendable {
     /// paid. The session adopts it as its pinned target (#12), so the existing expiry ladder is
     /// what handles a lease that has since run out.
     let resolvedURL: URL?
+    /// givo-33: the trust policy the warm was fetched under (nil: none). A load adopts the bytes only
+    /// under a policy that answers alike (`ServerTrustPolicy.answersAlike`), so bytes fetched over a
+    /// connection one policy accepted never enter a load that would have refused it.
+    var trust: ServerTrustPolicy.Stamp? = nil
 
     var byteCount: Int { head.data.count + (tail?.data.count ?? 0) }
 }

@@ -737,7 +737,8 @@ public final class Demuxer: @unchecked Sendable {
         // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
         // the source is not a recognizable disc, fall through to the streaming reader.
         if !isLive, Self.isDiscImageURL(url) {
-            let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
+            let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders,
+                                                    serverTrust: openProfile.serverTrust)   // givo-33
             if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm,
                                                           serverTrust: openProfile.serverTrust) {   // givo-31
                 adoptOwnedSourceReader(discReader)

@@ -114,7 +114,8 @@ enum SourcePrewarmFetcher {
                                      tail: tail,
                                      contentLength: head.total,
                                      requestHeaders: extraHeaders,
-                                     resolvedURL: head.respondedURL)
+                                     resolvedURL: head.respondedURL,
+                                     trust: serverTrust?.stamp)   // givo-33
         guard store.store(warmed, for: url) else {
             return decline(url, "\(warmed.byteCount) bytes exceed the prewarm store's cap")
         }

@@ -67,6 +67,7 @@ extension AetherEngine {
         // extractor when the disc title changes.
         return FrameExtractor(url: url, httpHeaders: loadedOptions.httpHeaders,
                               selectTitleID: activeDiscTitleID,
+                              serverTrust: loadedOptions.serverTrust,   // givo-33: the session's own policy
                               yieldWhile: sessionYieldSignal())
     }
 

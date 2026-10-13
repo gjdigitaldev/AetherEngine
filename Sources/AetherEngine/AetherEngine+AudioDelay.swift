@@ -186,10 +186,16 @@ extension AetherEngine {
     /// complete re-anchor; a burst in one runloop turn arrives before the Task reads the value and
     /// costs one. The pass starts the moment the first re-anchor returns, which on `.loopback` is
     /// before the rebuilt host has published a position; `rebuildPosition` covers that window.
-    private func reanchorForAudioDelay(_ reanchor: @escaping (_ position: Double, _ delay: Double) async -> Void) {
+    ///
+    /// GiVo R2596: the audio-stage switch (`setAudioSampleProcessingEnabled`) is the other value a loopback
+    /// re-cut delivers, so it rides this same latch and catch-up loop rather than a second path; `label`
+    /// names whichever value raised the re-anchor in its log lines (the audio delay when nil).
+    func reanchorForAudioDelay(label: (() -> String)? = nil,
+                               _ reanchor: @escaping (_ position: Double, _ delay: Double) async -> Void) {
+        let describe = label ?? { "AE#464: audio delay = \(Self.ms(self.loadedOptions.audioDelaySeconds))" }
         guard Self.audioDelayRecutIsPossible(state: state, isLive: isLive, liveWindow: liveWindow) else {
             EngineLog.emit(
-                "[AetherEngine] AE#464: audio delay = \(Self.ms(loadedOptions.audioDelaySeconds)) stands, "
+                "[AetherEngine] \(describe()) stands, "
                 + "but this session cannot re-anchor at the playhead (state=\(state), live=\(isLive)); "
                 + "it arrives at the next seam",
                 category: .engine
@@ -198,7 +204,7 @@ extension AetherEngine {
         }
         guard !audioDelayReanchorInFlight else {
             EngineLog.emit(
-                "[AetherEngine] AE#464: audio delay = \(Self.ms(loadedOptions.audioDelaySeconds)) folded "
+                "[AetherEngine] \(describe()) folded "
                 + "into the re-anchor already in flight; that rebuild delivers it",
                 category: .engine
             )
@@ -208,13 +214,14 @@ extension AetherEngine {
         Task { @MainActor in
             defer { self.audioDelayReanchorInFlight = false }
             var delivered = self.loadedOptions.audioDelaySeconds
+            var deliveredProcessing = self.loadedOptions.audioSampleProcessing   // GiVo R2596
             await reanchor(self.positionForSessionRebuild, delivered)
-            while AudioDelayPolicy.isChange(from: delivered, to: self.loadedOptions.audioDelaySeconds) {
+            while AudioDelayPolicy.isChange(from: delivered, to: self.loadedOptions.audioDelaySeconds)
+                    || deliveredProcessing != self.loadedOptions.audioSampleProcessing {
                 guard Self.audioDelayRecutIsPossible(
                     state: self.state, isLive: self.isLive, liveWindow: self.liveWindow) else {
                     EngineLog.emit(
-                        "[AetherEngine] AE#464: audio delay = "
-                        + "\(Self.ms(self.loadedOptions.audioDelaySeconds)) was asked for while the last "
+                        "[AetherEngine] \(describe()) was asked for while the last "
                         + "rebuild ran and this session can no longer re-anchor (state=\(self.state)); "
                         + "it arrives at the next seam",
                         category: .engine
@@ -222,6 +229,7 @@ extension AetherEngine {
                     return
                 }
                 delivered = self.loadedOptions.audioDelaySeconds
+                deliveredProcessing = self.loadedOptions.audioSampleProcessing
                 await reanchor(self.positionForSessionRebuild, delivered)
             }
         }

@@ -138,6 +138,9 @@ extension HLSVideoEngine {
     /// the same verdict the E-AC-3 route reaches through its failed cut, so a host can hand the
     /// position to a player that decodes the track itself.
     func handleBridgeDecodedNothing(streamIndex: Int32, summary: String) {
+        if reportForcedAudioBridgeFailure("the bridge decoded nothing from stream \(streamIndex): \(summary)") {
+            return
+        }
         if isLiveSession {
             onLiveAudioDecodesNothing?(streamIndex, summary)
             return
@@ -149,6 +152,33 @@ extension HLSVideoEngine {
         )
         surfaceVODSourceFailure(FFmpegErr.einval, "Audio track could not be decoded",
                                 kind: .audioBridgeProducedNoOutput)
+    }
+
+    var forcedBridgeFailureWasReported: Bool {
+        forcedBridgeFailureLock.lock()
+        defer { forcedBridgeFailureLock.unlock() }
+        return forcedBridgeFailureReported
+    }
+
+    /// GiVo R2596: hand a failure of a bridge that only the audio stage asked for to the engine, which rebuilds
+    /// the session once with the stage off (the source stream-copies there). True when the failure is taken,
+    /// in which case the caller neither surfaces it nor drops the audio; the first report of a session reaches
+    /// the engine and every later one is absorbed, because that rebuild is already on its way.
+    func reportForcedAudioBridgeFailure(_ reason: String) -> Bool {
+        guard audioBridgeForcedForStage, let handler = onForcedAudioBridgeFailure else { return false }
+        forcedBridgeFailureLock.lock()
+        let first = !forcedBridgeFailureReported
+        forcedBridgeFailureReported = true
+        forcedBridgeFailureLock.unlock()
+        if first {
+            EngineLog.emit(
+                "[HLSVideoEngine] R2596: the bridge the audio stage forced failed (\(reason)); handing the "
+                + "session back to the engine to play the original audio",
+                category: .session
+            )
+            handler(reason)
+        }
+        return true
     }
 
     /// Guards `audioSourceStreamIndexOverride` against stale picker selections from a previous title.
@@ -272,6 +302,8 @@ extension HLSVideoEngine {
                     )
                 }
             }
+        } else if preferBridge && sourceIsAtmos && processesAudioSamples {
+            // GiVo R2596: the host's audio stage asked for the bridge; the routing line above said what it costs.
         } else if preferBridge && sourceIsAtmos {
             // EAC3+JOC always stream-copies; a pre-bridge decision is a codec-table bug.
             EngineLog.emit(
@@ -301,7 +333,9 @@ extension HLSVideoEngine {
                         mode: audioBridgeMode,
                         // The first attempt lets the bridge resolve, so a container that under-reports its
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
-                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt
+                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
+                        // GiVo R2596: one stage per bridge, on every bridge of a session that asked for it.
+                        processor: processesAudioSamples ? AudioSampleProcessingRegistry.factory?() : nil
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
                     EngineLog.emit(
@@ -317,11 +351,13 @@ extension HLSVideoEngine {
                         + "falling back to SILENT video-only",
                         category: .session
                     )
+                    _ = reportForcedAudioBridgeFailure("bridge init failed: \(error)")   // GiVo R2596
                     break attempts
                 }
 
                 guard let cp = bridge.encoderCodecpar else {
                     bridge.close()
+                    _ = reportForcedAudioBridgeFailure("bridge opened no encoder parameters")   // GiVo R2596
                     break attempts
                 }
                 let cfg = HLSSegmentProducer.AudioConfig(
@@ -370,13 +406,15 @@ extension HLSVideoEngine {
                     self.savedAudioConfig = nil
                     self.audioBridge = nil
                     bridge.close()
+                    _ = reportForcedAudioBridgeFailure("bridge header write failed: \(error)")   // GiVo R2596
                     break attempts
                 }
             }
         }
 
         // Video-only fallback: illegal for demuxed-audio sessions (silent playback); fail and let the host fall back to server-muxed.
-        if sideAudioDemuxer != nil {
+        // GiVo R2596: except for the moment it takes the engine's rebuild to bring the stream copy back.
+        if sideAudioDemuxer != nil, !forcedBridgeFailureWasReported {
             throw HLSVideoEngineError.openFailed(
                 reason: "demuxed-audio companion present but no audio pipeline could be built")
         }

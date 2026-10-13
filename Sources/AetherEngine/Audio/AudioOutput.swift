@@ -29,7 +29,23 @@ final class AudioOutput: @unchecked Sendable {
         return _epoch
     }
 
-    init() {
+    /// GiVo R2596: the host's audio stage for this output, nil when no factory is installed. Taken at init, so
+    /// a factory installed mid-session reaches the next session's output, not this one.
+    private let processor: AudioSampleProcessing?
+
+    /// GiVo R2596: what `processor` was last prepared for, under `lock`. nil until the first buffer.
+    private struct ProcessorFormat: Equatable {
+        let sampleRate: Double
+        let channels: UInt32
+        let isInterleaved: Bool
+    }
+    private var processorFormat: ProcessorFormat?
+    private var loggedProcessorSkip = false
+
+    /// `processor` is a parameter so a test can hand one in without installing a process-wide factory under
+    /// suites that run in parallel; every production call site takes the default.
+    init(processor: AudioSampleProcessing? = AudioSampleProcessingRegistry.factory?()) {
+        self.processor = processor
         renderer = AVSampleBufferAudioRenderer()
         synchronizer = AVSampleBufferRenderSynchronizer()
         synchronizer.addRenderer(renderer)
@@ -217,6 +233,9 @@ final class AudioOutput: @unchecked Sendable {
             lock.unlock()
             return false
         }
+        // GiVo R2596: before `retimed`, whose copy shares these samples, and inside the lock so a flush
+        // cannot land between the stage and the renderer taking the buffer.
+        let processorLine = processor.flatMap { processInPlace(sampleBuffer, with: $0) }
         let offset = presentationOffset
         let delivered = offset == .zero ? sampleBuffer : Self.retimed(sampleBuffer, by: offset)
         var offsetLine: String?
@@ -235,6 +254,7 @@ final class AudioOutput: @unchecked Sendable {
         afterRendererEnqueueForTesting?()
         #endif
         lock.unlock()
+        if let processorLine { EngineLog.emit(processorLine, category: .swPlayback) }
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
 
         #if DEBUG
@@ -264,6 +284,71 @@ final class AudioOutput: @unchecked Sendable {
     private var _loggedFirstEnqueue = false
     private var _loggedRendererError = false
     #endif
+
+    /// GiVo R2596: run the host's stage over the buffer's own bytes. Caller holds `lock`. The decoder
+    /// allocated those bytes for this buffer alone, so writing them in place touches nothing else the
+    /// engine holds, apart from the #95 audio tap, which is fed this same buffer after the accept and so
+    /// carries the processed audio. `prepare` runs here, on the feed thread, never on the render thread.
+    /// The steady state allocates nothing: the buffer list lives on the stack and a line is built only
+    /// when there is one to log. Returns that line for the caller to emit once the lock is released.
+    private func processInPlace(_ sampleBuffer: CMSampleBuffer, with processor: AudioSampleProcessing) -> String? {
+        guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0,
+              asbd.mBitsPerChannel == 32,
+              asbd.mChannelsPerFrame > 0 else {
+            return processorSkipLine("not interleaved Float32 PCM")
+        }
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frames > 0 else { return nil }
+        let byteCount = frames * Int(asbd.mChannelsPerFrame) * 4
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer),
+              CMBlockBufferIsRangeContiguous(block, atOffset: 0, length: 0) else {
+            return processorSkipLine("block buffer is not contiguous")
+        }
+        var contiguousLength = 0
+        var data: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block,
+                                          atOffset: 0,
+                                          lengthAtOffsetOut: &contiguousLength,
+                                          totalLengthOut: nil,
+                                          dataPointerOut: &data) == kCMBlockBufferNoErr,
+              let data, contiguousLength >= byteCount else {
+            return processorSkipLine("block buffer shorter than \(frames) frames x \(asbd.mChannelsPerFrame) ch")
+        }
+
+        var line: String?
+        let current = ProcessorFormat(sampleRate: asbd.mSampleRate, channels: asbd.mChannelsPerFrame, isInterleaved: true)
+        if current != processorFormat {
+            let layoutTag = CMAudioFormatDescriptionGetChannelLayout(format, sizeOut: nil)?.pointee.mChannelLayoutTag ?? 0
+            processor.prepare(sampleRate: current.sampleRate,
+                              channelCount: Int(current.channels),
+                              isInterleaved: current.isInterleaved,
+                              layoutTag: layoutTag)
+            line = "[AudioOutput] sample processor "
+                + (processorFormat == nil ? "attached" : "re-prepared")
+                + " — \(Int(current.sampleRate)) Hz, \(current.channels) ch (R2596)"
+            processorFormat = current
+        }
+        var bufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(mNumberChannels: current.channels,
+                                  mDataByteSize: UInt32(byteCount),
+                                  mData: UnsafeMutableRawPointer(data)))
+        withUnsafeMutablePointer(to: &bufferList) {
+            processor.process(UnsafeMutableAudioBufferListPointer($0), frameCount: frames)
+        }
+        return line
+    }
+
+    /// One line per output: a buffer the stage cannot take is delivered unprocessed, never dropped.
+    private func processorSkipLine(_ reason: @autoclosure () -> String) -> String? {
+        guard !loggedProcessorSkip else { return nil }
+        loggedProcessorSkip = true
+        return "[AudioOutput] sample processor skipped a buffer: \(reason()); delivered unprocessed (R2596)"
+    }
 
     /// The shift itself, pure so it can be checked without a renderer. Every timing entry moves
     /// by `offset`, presentation and decode alike; an entry with no valid presentation stamp is left

@@ -2396,6 +2396,19 @@ public final class AetherEngine: ObservableObject {
     /// would be lost at the next audio-track switch or background return.
     func setLoadedAudioDelay(_ seconds: Double) { loadedOptions.audioDelaySeconds = seconds }
 
+    /// GiVo R2596: the same narrow write for the audio-stage switch, so every rebuild the session makes
+    /// on its own (reload at position, audio-track switch, background return) keeps the bridge choice.
+    func setLoadedAudioSampleProcessing(_ on: Bool) { loadedOptions.audioSampleProcessing = on }
+
+    /// GiVo R2596: a bridge the audio stage forced failed on this title, and the session was rebuilt on its
+    /// original audio. Outlives the session's own rebuilds, which is what stops a second attempt; a host load
+    /// clears it. See `dropAudioSampleProcessingForSession`.
+    var audioSampleProcessingDroppedForSession = false
+    #if DEBUG
+    /// Test-only: replaces the takeover rebuild the drop starts, and receives the option change it applies.
+    var audioSampleProcessingDropRebuildForTesting: ((@escaping @Sendable (inout LoadOptions) -> Void) -> Void)?
+    #endif
+
     /// AE#464 round 2: the fourth narrow write, and the one that makes a session-preserving reload
     /// preserve the session's transport. `autoplay` describes a MOUNT, and a rebuild is not a mount;
     /// writing the session's own transport state here is what both reload branches then replay,
@@ -4386,6 +4399,8 @@ public final class AetherEngine: ObservableObject {
         softwarePathEscalationBudget = SoftwarePathEscalation.Budget()
         undecodableLiveAudioStreamIndices = Self.undecodableAudioStreamIndicesAcrossLoad(
             undecodableLiveAudioStreamIndices, sessionPreservingReload: sessionPreservingReloadInFlight)
+        audioSampleProcessingDroppedForSession = Self.audioSampleProcessingDropAcrossLoad(   // GiVo R2596
+            audioSampleProcessingDroppedForSession, sessionPreservingReload: sessionPreservingReloadInFlight)
         masterFallbackUsed = false
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil

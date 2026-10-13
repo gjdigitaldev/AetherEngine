@@ -932,6 +932,7 @@ extension AetherEngine {
         )
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
+        session.audioSampleProcessing = loadedOptions.audioSampleProcessing   // GiVo R2596: decides stream copy vs bridge at start()
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
         session.servesLandingSegmentProgressively = loadedOptions.progressiveSegmentDeliveryAfterSeek   // givo-22
         session.firstSegmentTargetSeconds = loadedOptions.firstSegmentTargetSeconds   // givo-3
@@ -1163,6 +1164,11 @@ extension AetherEngine {
                 }
                 await self.escalateToSoftwarePath(request, expectedGeneration: generation)
             }
+        }
+        // GiVo R2596: a bridge only the audio stage asked for failed. Generation-guarded rather than
+        // session-guarded: the load-time failures fire inside start(), before `nativeVideoSession` is set.
+        session.onForcedAudioBridgeFailure = { [weak self] reason in
+            self?.hop(for: generation) { [weak self] in self?.dropAudioSampleProcessingForSession(reason: reason) }
         }
         // AE#641: the live bridge decoded nothing, so the served media carries an audio track that
         // will never be filled and AVPlayer waits on it forever. The session is rebuilt video-only.

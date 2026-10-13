@@ -1,4 +1,6 @@
 import Foundation
+import AudioToolbox
+import CoreAudio
 import AetherLibavcodec
 import AetherLibavutil
 import AetherLibswresample
@@ -6,6 +8,13 @@ import AetherLibswresample
 /// Transcoding bridge for the HLS-fMP4 pipeline's audio sidecar. Decodes a source stream (TrueHD, DTS, DTS-HD MA,
 /// Vorbis, PCM, MP2) to PCM, resamples, re-encodes in one of two modes, emits packets HLSSegmentProducer writes
 /// alongside video in the same fMP4 fragments.
+///
+/// GiVo R2596: with `LoadOptions.audioSampleProcessing` on (and a host stage installed) EVERY source enters here,
+/// stream-copyable ones included, and the host's `AudioSampleProcessing` runs in place on the resampled PCM
+/// between swr and the FIFO. What that costs while it is on: an E-AC-3 JOC (Atmos) source loses its object
+/// metadata like any bridged bitstream, nothing reaches the renderer as its original bitstream, and turning it
+/// on or off mid-session is a re-cut at the playhead (a brief rebuffer) because segments already cut carry the
+/// old audio. Off, the stream copy is untouched and passthrough is intact.
 ///
 /// Motivation: AVPlayer's fMP4 path decodes AAC/AC3/EAC3 (incl. Atmos JOC)/FLAC/ALAC/MP3/Opus directly, but FFmpeg's
 /// mp4 muxer can't always stream-copy EAC3 from MKV (the dec3 box needs pre-parsed extradata MKV CodecPrivate often
@@ -215,6 +224,15 @@ final class AudioBridge: @unchecked Sendable {
 
     private let srcTimeBase: AVRational
     private let mode: Mode
+
+    /// GiVo R2596: the host's audio stage, nil for a plain transcode. Prepared once at init (the PCM side of swr
+    /// is fixed for the bridge's life: encoder rate, encoder channels, `pcmSampleFmt`), run per resampled block.
+    private let processor: AudioSampleProcessing?
+    /// GiVo R2596: one `AudioBuffer` per plane for a planar (FLTP, E-AC-3) intermediate. malloc'd, freed in cleanup.
+    private var processorPlanes: UnsafeMutableAudioBufferListPointer?
+    /// GiVo R2596: an interleaved Float32 view of an integer (S16 / S32, FLAC) intermediate, grown on demand.
+    private var processorScratch: UnsafeMutablePointer<Float>?
+    private var processorScratchCapacity = 0
     private var resampledFrame: UnsafeMutablePointer<AVFrame>?
 
     /// Encoder PTS counter in encoder time base, incremented by nb_samples/frame. FLAC demands monotonically
@@ -257,10 +275,12 @@ final class AudioBridge: @unchecked Sendable {
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
         mode: Mode = .surroundCompat,
-        forcedEncoder: AVCodecID? = nil
+        forcedEncoder: AVCodecID? = nil,
+        processor: AudioSampleProcessing? = nil
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
+        self.processor = processor
 
         // 1. Source decoder
         let srcCodecID = srcCodecpar.pointee.codec_id
@@ -484,6 +504,30 @@ final class AudioBridge: @unchecked Sendable {
             throw AudioBridgeError.encoderAllocFailed
         }
         fifo = fifoPtr
+
+        if let processor {
+            let planar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
+            if planar {
+                processorPlanes = AudioBufferList.allocate(maximumBuffers: Int(nChannels))
+            }
+            processor.prepare(sampleRate: Double(sampleRate),
+                              channelCount: Int(nChannels),
+                              isInterleaved: !planar,
+                              layoutTag: Self.processorLayoutTag(channels: nChannels))
+            let fmtName = av_get_sample_fmt_name(pcmSampleFmt).map { String(cString: $0) } ?? "?"
+            EngineLog.emit(
+                "[AudioBridge] sample processor attached — \(sampleRate) Hz, \(nChannels) ch, "
+                + "\(fmtName) \(planar ? "planar" : "interleaved") (R2596)",
+                category: .session
+            )
+        }
+    }
+
+    /// GiVo R2596: the CoreAudio tag for the order the bytes are in. The encoder layout is FFmpeg's default for
+    /// the count, which `audioChannelLayoutTag(for:)` names exactly except at 7, where FFmpeg's 6.1 (FL FR FC
+    /// LFE BC SL SR) has no CoreAudio tag; that count is described as discrete rather than misnamed.
+    static func processorLayoutTag(channels: Int32) -> UInt32 {
+        channels == 7 ? kAudioChannelLayoutTag_DiscreteInOrder | 7 : audioChannelLayoutTag(for: channels)
     }
 
     deinit {
@@ -818,6 +862,13 @@ final class AudioBridge: @unchecked Sendable {
             av_audio_fifo_free(f)
             fifo = nil
         }
+        if let planes = processorPlanes {
+            free(planes.unsafeMutablePointer)
+            processorPlanes = nil
+        }
+        processorScratch?.deallocate()
+        processorScratch = nil
+        processorScratchCapacity = 0
     }
 
     // MARK: - Feed
@@ -1126,6 +1177,10 @@ final class AudioBridge: @unchecked Sendable {
             return
         }
 
+        if let processor {
+            runProcessor(processor, on: buffers, frames: Int(producedSamples), channels: Int(nChannels))
+        }
+
         // av_audio_fifo_write takes void **data; the same array works for both layouts (FIFO knows the format).
         let written = outPtrs.withUnsafeMutableBufferPointer { fifoBuf in
             fifoBuf.baseAddress!.withMemoryRebound(
@@ -1137,6 +1192,71 @@ final class AudioBridge: @unchecked Sendable {
         if written > 0 {
             stats.samplesEnqueued += Int64(written)
             stats.packetsFedSinceLastEnqueue = 0
+        }
+    }
+
+    /// GiVo R2596: the host's stage over one resampled block, in place and in the layout swr produced it in. The
+    /// planar Float32 (E-AC-3) intermediate is handed over as is, one buffer per channel; an integer (FLAC)
+    /// intermediate through an interleaved Float32 view, converted back with clipping. With a stage that changes
+    /// nothing the integer round trip is exact: S16 / 2^15 and a 24-bit value in S32 / 2^31 are both exact in
+    /// Float32, so the lossless path stays bit-perfect while the stage is a pass-through.
+    private func runProcessor(_ processor: AudioSampleProcessing, on buffers: [UnsafeMutablePointer<UInt8>],
+                              frames: Int, channels: Int) {
+        switch pcmSampleFmt {
+        case AV_SAMPLE_FMT_FLTP:
+            guard let planes = processorPlanes, planes.count == channels, buffers.count == channels else { return }
+            for channel in 0..<channels {
+                planes[channel] = AudioBuffer(mNumberChannels: 1,
+                                              mDataByteSize: UInt32(frames * 4),
+                                              mData: UnsafeMutableRawPointer(buffers[channel]))
+            }
+            processor.process(planes, frameCount: frames)
+
+        case AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S32:
+            guard let interleaved = buffers.first else { return }
+            let count = frames * channels
+            if count > processorScratchCapacity {
+                processorScratch?.deallocate()
+                processorScratch = UnsafeMutablePointer<Float>.allocate(capacity: count)
+                processorScratchCapacity = count
+            }
+            guard let scratch = processorScratch else { return }
+            let isS16 = pcmSampleFmt == AV_SAMPLE_FMT_S16
+            if isS16 {
+                interleaved.withMemoryRebound(to: Int16.self, capacity: count) { samples in
+                    for i in 0..<count { scratch[i] = Float(samples[i]) * (1 / 32_768) }
+                }
+            } else {
+                interleaved.withMemoryRebound(to: Int32.self, capacity: count) { samples in
+                    for i in 0..<count { scratch[i] = Float(samples[i]) * (1 / 2_147_483_648) }
+                }
+            }
+            var list = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(mNumberChannels: UInt32(channels),
+                                      mDataByteSize: UInt32(count * 4),
+                                      mData: UnsafeMutableRawPointer(scratch)))
+            withUnsafeMutablePointer(to: &list) {
+                processor.process(UnsafeMutableAudioBufferListPointer($0), frameCount: frames)
+            }
+            if isS16 {
+                interleaved.withMemoryRebound(to: Int16.self, capacity: count) { samples in
+                    for i in 0..<count {
+                        let value = (Double(scratch[i]) * 32_768).rounded()
+                        samples[i] = value.isNaN ? 0 : Int16(min(max(value, -32_768), 32_767))
+                    }
+                }
+            } else {
+                interleaved.withMemoryRebound(to: Int32.self, capacity: count) { samples in
+                    for i in 0..<count {
+                        let value = (Double(scratch[i]) * 2_147_483_648).rounded()
+                        samples[i] = value.isNaN ? 0 : Int32(min(max(value, -2_147_483_648), 2_147_483_647))
+                    }
+                }
+            }
+
+        default:
+            break
         }
     }
 

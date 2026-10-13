@@ -748,6 +748,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Pairing the release with the surface makes that structural instead of a call site to remember.
     func surfaceVODSourceFailure(_ code: Int32, _ reason: String,
                                  kind: PlaybackErrorKind = .vodSourceFailed) {
+        // GiVo R2596: a bridge the audio stage forced is the engine's to undo, not a failure of the source.
+        if kind == .audioBridgeProducedNoOutput, reportForcedAudioBridgeFailure(reason) { return }
         // AE#641: a silent bridge is reported the moment it is structural and again by the muxer arms
         // that follow it on the E-AC-3 route; the session learns it once.
         if kind == .audioBridgeProducedNoOutput {
@@ -789,6 +791,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// that has already been cut; `AetherEngine.setAudioDelay` writes it as part of a reload, which is
     /// what actually replaces the segments and the item holding them.
     public var audioDelaySeconds: Double = 0
+
+    /// GiVo R2596: `LoadOptions.audioSampleProcessing`, set before `start()`. Read once there, where the
+    /// audio is routed, so a change reaches a running session only through a rebuild.
+    var audioSampleProcessing = false
+
+    /// GiVo R2596: the switch is on AND the host installed a stage. Without a stage a forced bridge would be
+    /// a transcode that changes nothing but the bitstream.
+    var processesAudioSamples: Bool {
+        audioSampleProcessing && AudioSampleProcessingRegistry.factory != nil
+    }
+
+    /// GiVo R2596: this session's bridge exists only because the host's audio stage asked for it; without the
+    /// stage the source stream-copies. Set at routing, read by `reportForcedAudioBridgeFailure`.
+    var audioBridgeForcedForStage = false
+    /// GiVo R2596: a forced bridge failed (no decoder, header write, decoded nothing). The engine rebuilds the
+    /// session once with the stage off instead of letting the title go silent or fail. Set before `start()`.
+    var onForcedAudioBridgeFailure: (@Sendable (String) -> Void)?
+    let forcedBridgeFailureLock = NSLock()
+    var forcedBridgeFailureReported = false
 
     /// `LoadOptions.progressiveSegmentDelivery`, handed to the provider and to every producer this
     /// session builds. Set before `start()`.
@@ -1872,7 +1893,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     frameSize: acpForHE.frame_size,
                     hasASC: hasASC
                 )
-            if compat.requiresBridge || isHEAAC {
+            if processesAudioSamples, compat != .unsupported, !compat.requiresBridge, !isHEAAC {
+                // GiVo R2596: the bridge is the one place on this route where the engine holds PCM, so the
+                // host's stage needs every source in it. The decoder is asked for by id, so anything
+                // libavcodec decodes qualifies; the encoder stays the session's `audioBridgeMode`.
+                bridgePreferred = true
+                audioBridgeForcedForStage = true
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: codec=\(compat) bridged for the host's audio stage (R2596), "
+                    + "decoding + "
+                    + Self.encoderLabel(AudioBridge.bridgeEncoder(
+                        for: audioBridgeMode,
+                        sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased()
+                    + " re-encode instead of stream copy"
+                    + (compat == .eac3 && acpForHE.profile == 30
+                       ? "; E-AC-3 JOC (Atmos) object metadata does not survive it" : ""),
+                    category: .session
+                )
+            } else if compat.requiresBridge || isHEAAC {
                 bridgePreferred = true
                 EngineLog.emit(
                     isHEAAC

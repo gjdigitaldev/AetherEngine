@@ -918,6 +918,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// `AetherEngine.setAudioDelay(_:)`, which is the same value seen from the other end.
     public var audioDelaySeconds: Double = 0
 
+    /// GiVo R2596: run the host's `AudioSampleProcessingRegistry` stage on this session's audio. On
+    /// `.loopback` it routes EVERY audio source through `AudioBridge` (decode, stage, re-encode in
+    /// `audioBridgeMode`) instead of stream-copying it, so while it is on an E-AC-3 JOC (Atmos) source
+    /// loses its object metadata and no source reaches the renderer as its original bitstream; off, the
+    /// stream copy is untouched. `.software` / `.audio` decode in the engine and run the stage whatever
+    /// this says; `.remoteBypass` cannot (AVPlayer owns the media). Ignored while no factory is
+    /// installed. Change it mid-session with `AetherEngine.setAudioSampleProcessingEnabled(_:)`.
+    public var audioSampleProcessing: Bool = false
+
     /// Teletext caption page for `dvb_teletext` subtitle decode. nil (default) = libzvbi auto-detect
     /// (`txt_page=subtitle`); an explicit page (e.g. 801 for AU) targets channels whose caption page
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).

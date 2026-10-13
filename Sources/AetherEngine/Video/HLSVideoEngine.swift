@@ -1899,15 +1899,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // libavcodec decodes qualifies; the encoder stays the session's `audioBridgeMode`.
                 bridgePreferred = true
                 audioBridgeForcedForStage = true
+                let stageEncoder = AudioBridge.stageBridgeEncoder(   // GiVo R2596-r2
+                    for: audioBridgeMode, sourceCodec: acpForHE.codec_id, sourceChannels: acpForHE.ch_layout.nb_channels)
+                let foldsTo51 = stageEncoder == AV_CODEC_ID_EAC3   // GiVo R2596-r2
+                    && acpForHE.ch_layout.nb_channels > AudioBridge.maxEncodedChannels(for: AV_CODEC_ID_EAC3)
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) bridged for the host's audio stage (R2596), "
                     + "decoding + "
-                    + Self.encoderLabel(AudioBridge.bridgeEncoder(
-                        for: audioBridgeMode,
-                        sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased()
+                    + Self.encoderLabel(stageEncoder).uppercased()
                     + " re-encode instead of stream copy"
                     + (compat == .eac3 && acpForHE.profile == 30
-                       ? "; E-AC-3 JOC (Atmos) object metadata does not survive it" : ""),
+                       ? "; E-AC-3 JOC (Atmos) object metadata does not survive it" : "")
+                    + (foldsTo51   // GiVo R2596-r2
+                       ? "; its \(acpForHE.ch_layout.nb_channels) channels fold to 5.1 (E-AC-3 carries 6) while the stage is on"
+                       : ""),
                     category: .session
                 )
             } else if compat.requiresBridge || isHEAAC {

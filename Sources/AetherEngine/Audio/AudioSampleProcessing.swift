@@ -4,7 +4,7 @@ import Foundation
 
 /// GiVo R2596 — a host-supplied real-time audio stage. `prepare` runs OFF the real-time thread whenever a
 /// session's output format is (re)established and may be called again; `process` runs on the thread that
-/// owns the samples (the renderer feed, or AVPlayer's tap thread): in place, no allocation, no blocking lock.
+/// owns the samples (the renderer feed, or the bridge's producer): in place, no allocation, no blocking lock.
 ///
 /// Where it runs:
 /// - `.software` / decoded `.audio` (FFmpeg decode into `AVSampleBufferAudioRenderer`): every decoded buffer, in
@@ -14,10 +14,18 @@ import Foundation
 ///   sees planar Float32 (E-AC-3 encoder) or interleaved Float32 (FLAC encoder). See `AudioBridge` for what the
 ///   re-encode costs while it is on.
 /// - `.remoteBypass`: never. AVPlayer owns that media, and it ignores an `AVAudioMix` on HLS anyway (an HLS
-///   asset vends no `AVAssetTrack` for one to bind to), which is why no AVPlayer tap exists on any route.
+///   asset vends no `AVAssetTrack` for one to bind to), so the engine never holds that audio.   // GiVo R2596-r2
 public protocol AudioSampleProcessing: AnyObject {
     func prepare(sampleRate: Double, channelCount: Int, isInterleaved: Bool, layoutTag: UInt32)
     func process(_ bufferList: UnsafeMutableAudioBufferListPointer, frameCount: Int)
+    /// GiVo R2596-r2 — the output dropped what it had queued (`AudioOutput.flush`, i.e. a seek): whatever the stage
+    /// still holds belongs to that dropped audio. Never called from inside `process`.
+    func reset()
+}
+
+/// GiVo R2596-r2 — a stage with nothing queued ignores it.
+public extension AudioSampleProcessing {
+    func reset() {}
 }
 
 public enum AudioSampleProcessingRegistry {

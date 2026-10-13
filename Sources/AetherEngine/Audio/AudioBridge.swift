@@ -16,6 +16,13 @@ import AetherLibswresample
 /// on or off mid-session is a re-cut at the playhead (a brief rebuffer) because segments already cut carry the
 /// old audio. Off, the stream copy is untouched and passthrough is intact.
 ///
+/// GiVo R2596-r2: the stage's own settings are read per resampled block, so they too are baked into the
+/// segments as they are cut: a change of them while the stage stays on is the same one re-cut
+/// (`AetherEngine.audioSampleProcessingParametersDidChange()`). A stream-copyable source above six channels
+/// folds to 5.1 while the stage is on when the encoder is E-AC-3 (an E-AC-3, AAC or Opus 7.1 track, which
+/// stays a passthrough bitstream that way); a FLAC or ALAC 7.1 track takes FLAC instead and keeps all eight
+/// channels (`stageBridgeEncoder`).
+///
 /// Motivation: AVPlayer's fMP4 path decodes AAC/AC3/EAC3 (incl. Atmos JOC)/FLAC/ALAC/MP3/Opus directly, but FFmpeg's
 /// mp4 muxer can't always stream-copy EAC3 from MKV (the dec3 box needs pre-parsed extradata MKV CodecPrivate often
 /// lacks -> avformat_write_header -22 EINVAL); TrueHD/DTS aren't legal in fMP4 per ISOBMFF+HLS spec. FLAC and EAC3
@@ -64,6 +71,20 @@ final class AudioBridge: @unchecked Sendable {
         case .lossless:       return AV_CODEC_ID_FLAC
         case .surroundCompat: return sourceChannels > 2 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_FLAC
         }
+    }
+
+    /// GiVo R2596-r2: the encoder of a bridge that exists only because the host's audio stage forced it (the
+    /// source would have stream-copied). The mode's choice, with one exception: a FLAC or ALAC source above six
+    /// channels reached the renderer as LPCM before the stage forced the bridge, and E-AC-3 stops at six, so it
+    /// takes FLAC and keeps every channel instead of folding 7.1 to 5.1. An E-AC-3, AAC or Opus source above six
+    /// channels keeps the mode's E-AC-3 (a bitstream an HDMI or ARC receiver still decodes) and folds to 5.1 while
+    /// the stage is on; the routing line says so.
+    static func stageBridgeEncoder(for mode: Mode, sourceCodec: AVCodecID, sourceChannels: Int32) -> AVCodecID {
+        let resolved = bridgeEncoder(for: mode, sourceChannels: sourceChannels)
+        guard resolved == AV_CODEC_ID_EAC3,
+              sourceChannels > maxEncodedChannels(for: AV_CODEC_ID_EAC3),
+              sourceCodec == AV_CODEC_ID_FLAC || sourceCodec == AV_CODEC_ID_ALAC else { return resolved }
+        return AV_CODEC_ID_FLAC
     }
 
     /// The other encoder a build can carry, for the #165 cascade when the resolved one is absent.

@@ -319,9 +319,16 @@ extension HLSVideoEngine {
             // video-only after one attempt, try the other encoder. Only encoder-absence cascades (retrying
             // a different encoder can help); every other init failure is source-specific and re-attempting
             // is pointless, so it stops immediately.
-            let firstAttempt = AudioBridge.bridgeEncoder(
-                for: audioBridgeMode,
-                sourceChannels: audioStream.pointee.codecpar.pointee.ch_layout.nb_channels)
+            let sourceChannels = audioStream.pointee.codecpar.pointee.ch_layout.nb_channels
+            let modeEncoder = AudioBridge.bridgeEncoder(for: audioBridgeMode, sourceChannels: sourceChannels)
+            // GiVo R2596-r2: a bridge only the stage asked for keeps a FLAC/ALAC source's 7.1 (see
+            // `AudioBridge.stageBridgeEncoder`); that choice is forced from the first attempt on.
+            let firstAttempt = audioBridgeForcedForStage
+                ? AudioBridge.stageBridgeEncoder(for: audioBridgeMode,
+                                                 sourceCodec: audioStream.pointee.codecpar.pointee.codec_id,
+                                                 sourceChannels: sourceChannels)
+                : modeEncoder
+            let stagePickedEncoder = firstAttempt != modeEncoder   // GiVo R2596-r2
             let cascade = Self.bridgeEncoderCascade(firstAttempt: firstAttempt)
             attempts: for (attemptIndex, encoderAttempt) in cascade.enumerated() {
                 let isLastAttempt = attemptIndex == cascade.count - 1
@@ -333,7 +340,7 @@ extension HLSVideoEngine {
                         mode: audioBridgeMode,
                         // The first attempt lets the bridge resolve, so a container that under-reports its
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
-                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
+                        forcedEncoder: attemptIndex == 0 && !stagePickedEncoder ? nil : encoderAttempt,   // GiVo R2596-r2
                         // GiVo R2596: one stage per bridge, on every bridge of a session that asked for it.
                         processor: processesAudioSamples ? AudioSampleProcessingRegistry.factory?() : nil
                     )

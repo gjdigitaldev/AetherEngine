@@ -189,7 +189,9 @@ extension AetherEngine {
     ///
     /// GiVo R2596: the audio-stage switch (`setAudioSampleProcessingEnabled`) is the other value a loopback
     /// re-cut delivers, so it rides this same latch and catch-up loop rather than a second path; `label`
-    /// names whichever value raised the re-anchor in its log lines (the audio delay when nil).
+    /// names whichever value raised the re-anchor in its log lines (the audio delay when nil). GiVo R2596-r2:
+    /// so does a change of the stage's own settings (`audioSampleProcessingParametersDidChange`), counted by
+    /// `audioSampleProcessingParameterGeneration`.
     func reanchorForAudioDelay(label: (() -> String)? = nil,
                                _ reanchor: @escaping (_ position: Double, _ delay: Double) async -> Void) {
         let describe = label ?? { "AE#464: audio delay = \(Self.ms(self.loadedOptions.audioDelaySeconds))" }
@@ -215,9 +217,13 @@ extension AetherEngine {
             defer { self.audioDelayReanchorInFlight = false }
             var delivered = self.loadedOptions.audioDelaySeconds
             var deliveredProcessing = self.loadedOptions.audioSampleProcessing   // GiVo R2596
+            var deliveredStageGeneration = self.audioSampleProcessingParameterGeneration   // GiVo R2596-r2
             await reanchor(self.positionForSessionRebuild, delivered)
-            while AudioDelayPolicy.isChange(from: delivered, to: self.loadedOptions.audioDelaySeconds)
-                    || deliveredProcessing != self.loadedOptions.audioSampleProcessing {
+            while Self.audioReanchorOwesAnotherPass(   // GiVo R2596-r2
+                deliveredDelay: delivered, delay: self.loadedOptions.audioDelaySeconds,
+                deliveredProcessing: deliveredProcessing, processing: self.loadedOptions.audioSampleProcessing,
+                deliveredStageGeneration: deliveredStageGeneration,
+                stageGeneration: self.audioSampleProcessingParameterGeneration) {
                 guard Self.audioDelayRecutIsPossible(
                     state: self.state, isLive: self.isLive, liveWindow: self.liveWindow) else {
                     EngineLog.emit(
@@ -230,6 +236,7 @@ extension AetherEngine {
                 }
                 delivered = self.loadedOptions.audioDelaySeconds
                 deliveredProcessing = self.loadedOptions.audioSampleProcessing
+                deliveredStageGeneration = self.audioSampleProcessingParameterGeneration   // GiVo R2596-r2
                 await reanchor(self.positionForSessionRebuild, delivered)
             }
         }

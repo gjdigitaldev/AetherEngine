@@ -933,6 +933,7 @@ extension AetherEngine {
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         session.audioSampleProcessing = loadedOptions.audioSampleProcessing   // GiVo R2596: decides stream copy vs bridge at start()
+        audioSampleProcessingGenerationAtSessionStart = audioSampleProcessingParameterGeneration   // GiVo R2596-r2
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
         session.servesLandingSegmentProgressively = loadedOptions.progressiveSegmentDeliveryAfterSeek   // givo-22
         session.firstSegmentTargetSeconds = loadedOptions.firstSegmentTargetSeconds   // givo-3

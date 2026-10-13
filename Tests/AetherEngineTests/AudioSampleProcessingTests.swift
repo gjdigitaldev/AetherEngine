@@ -19,14 +19,20 @@ private final class CountingProcessor: AudioSampleProcessing, @unchecked Sendabl
     var lastByteSize: UInt32 = 0
     var totalFrames = 0
     var firstSampleSeen: Float?
+    var resetCount = 0   // GiVo R2596-r2
+    /// GiVo R2596-r2: runs inside `prepare`, to prove what the caller holds while it does.
+    var duringPrepare: (() -> Void)?
 
     func prepare(sampleRate: Double, channelCount: Int, isInterleaved: Bool, layoutTag: UInt32) {
         prepareCount += 1
+        duringPrepare?()
         preparedSampleRate = sampleRate
         preparedChannels = channelCount
         preparedInterleaved = isInterleaved
         preparedLayoutTag = layoutTag
     }
+
+    func reset() { resetCount += 1 }   // GiVo R2596-r2
 
     func process(_ bufferList: UnsafeMutableAudioBufferListPointer, frameCount: Int) {
         processCount += 1
@@ -149,6 +155,47 @@ struct AudioSampleProcessingTests {
         #expect(processor.processCount == 0)
         #expect(firstSample(of: buffer) == 1.0)
     }
+
+    @Test("GiVo R2596-r2: a flush resets the stage (what it holds belongs to the flushed audio)")
+    func flushResetsTheStage() throws {
+        let processor = CountingProcessor()
+        let output = AudioOutput(processor: processor)
+        let buffer = try #require(makeStereoBuffer(pts: 10, frames: 1024))
+        #expect(output.enqueue(sampleBuffer: buffer, ifEpoch: output.epoch))
+        #expect(processor.resetCount == 0)
+        output.flush()
+        #expect(processor.resetCount == 1)
+    }
+
+    @Test("GiVo R2596-r2: prepare runs outside the output's lock (another thread takes it meanwhile)")
+    func prepareRunsOutsideTheLock() throws {
+        let processor = CountingProcessor()
+        let output = AudioOutput(processor: processor)
+        let lockWasFree = LockedFlag()
+        processor.duringPrepare = {
+            // `epoch` takes the output's lock. Held by the enqueue that is preparing, this read would wait out
+            // the timeout instead of signalling.
+            let done = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                _ = output.epoch
+                done.signal()
+            }
+            lockWasFree.set(done.wait(timeout: .now() + 2) == .success)
+        }
+        let buffer = try #require(makeStereoBuffer(pts: 10, frames: 1024))
+        #expect(output.enqueue(sampleBuffer: buffer, ifEpoch: output.epoch))
+        #expect(processor.prepareCount == 1)
+        #expect(processor.processCount == 1)
+        #expect(lockWasFree.value)
+    }
+}
+
+/// GiVo R2596-r2: a one-shot flag the prepare probe sets from inside the stage.
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value = false
+    func set(_ v: Bool) { lock.withLock { _value = v } }
+    var value: Bool { lock.withLock { _value } }
 }
 
 /// GiVo R2596: the loopback route's audio stage runs inside `AudioBridge`, between the resampler and the encoder,
@@ -241,6 +288,24 @@ struct AudioBridgeSampleProcessingTests {
         #expect(processor.firstSampleSeen == 0.5)
     }
 
+    @Test("GiVo R2596-r2: a stage-forced bridge keeps a FLAC / ALAC 7.1 track whole; E-AC-3 / AAC / Opus fold to 5.1")
+    func stageBridgeEncoderTable() {
+        func pick(_ mode: AudioBridge.Mode, _ codec: AVCodecID, _ channels: Int32) -> AVCodecID {
+            AudioBridge.stageBridgeEncoder(for: mode, sourceCodec: codec, sourceChannels: channels)
+        }
+        #expect(pick(.surroundCompat, AV_CODEC_ID_FLAC, 8) == AV_CODEC_ID_FLAC)
+        #expect(pick(.surroundCompat, AV_CODEC_ID_ALAC, 7) == AV_CODEC_ID_FLAC)
+        #expect(pick(.surroundCompat, AV_CODEC_ID_EAC3, 8) == AV_CODEC_ID_EAC3)
+        #expect(pick(.surroundCompat, AV_CODEC_ID_AAC, 8) == AV_CODEC_ID_EAC3)
+        #expect(pick(.surroundCompat, AV_CODEC_ID_OPUS, 8) == AV_CODEC_ID_EAC3)
+        #expect(pick(.surroundCompat, AV_CODEC_ID_FLAC, 6) == AV_CODEC_ID_EAC3)
+        #expect(pick(.surroundCompat, AV_CODEC_ID_FLAC, 2) == AV_CODEC_ID_FLAC)
+        #expect(pick(.surroundCompat, AV_CODEC_ID_AAC, 2) == AV_CODEC_ID_FLAC)
+        #expect(pick(.lossless, AV_CODEC_ID_EAC3, 8) == AV_CODEC_ID_FLAC)
+        // The mode's own resolution is unchanged for a bridge the source needs anyway.
+        #expect(AudioBridge.bridgeEncoder(for: .surroundCompat, sourceChannels: 8) == AV_CODEC_ID_EAC3)
+    }
+
     @Test("no processor: the bridge is the plain transcode it was")
     func noProcessorIsAPlainTranscode() throws {
         var par: UnsafeMutablePointer<AVCodecParameters>? = makePCMCodecpar(channels: 2)
@@ -329,10 +394,123 @@ struct ForcedAudioBridgeFallbackTests {
         #expect(engine.audioSampleProcessingEnabled == false)
     }
 
+    @MainActor
+    @Test("GiVo R2596-r2: the drop turns the stage off at once and tells the host once")
+    func dropTellsTheHostOnce() throws {
+        let engine = try AetherEngine()
+        var options = LoadOptions()
+        options.audioSampleProcessing = true
+        engine.setLoadedOptionsForTesting(options)
+        engine.audioSampleProcessingDropRebuildForTesting = { _ in }
+        var reports: [(String, Bool)] = []
+        engine.onAudioSampleProcessingDropped = { reason, refused in reports.append((reason, refused)) }
+
+        engine.dropAudioSampleProcessingForSession(reason: "the bridge decoded nothing")
+        #expect(engine.audioSampleProcessingEnabled == false)   // a superseding reload cannot cut with it on
+        engine.dropAudioSampleProcessingForSession(reason: "again")
+        #expect(reports.count == 1)
+        #expect(reports.first?.0 == "the bridge decoded nothing")
+        #expect(reports.first?.1 == false)
+    }
+
     @Test("the session's own rebuilds keep the drop; a host load starts clean")
     func dropAcrossLoad() {
         #expect(AetherEngine.audioSampleProcessingDropAcrossLoad(true, sessionPreservingReload: true))
         #expect(AetherEngine.audioSampleProcessingDropAcrossLoad(true, sessionPreservingReload: false) == false)
         #expect(AetherEngine.audioSampleProcessingDropAcrossLoad(false, sessionPreservingReload: true) == false)
+    }
+}
+
+/// GiVo R2596-r2: a change of the stage's own settings is baked into the loopback segments as they are cut, so it
+/// re-cuts like a toggle; the re-anchor latch counts it; a load that started cutting before a change re-cuts once
+/// it settles.
+@Suite("Audio stage settings changes (GiVo R2596-r2)")
+struct AudioStageParameterChangeTests {
+
+    @Test("the route table")
+    func routeTable() {
+        func action(on: Bool = true, factory: Bool = true, dropped: Bool = false,
+                    state: PlaybackState = .playing, route: VideoRoute, avPlayerAudio: Bool = false)
+            -> AetherEngine.AudioStageParameterChange {
+            AetherEngine.audioStageParameterChange(stageOn: on, factoryInstalled: factory, droppedForTitle: dropped,
+                                                   state: state, route: route, audioAVPlayerActive: avPlayerAudio)
+        }
+        #expect(action(route: .loopback) == .recut)
+        #expect(action(state: .paused, route: .loopback) == .recut)
+        #expect(action(on: false, route: .loopback) == .noStage)
+        #expect(action(dropped: true, route: .loopback) == .noStage)
+        #expect(action(factory: false, route: .loopback) == .noStage)
+        #expect(action(state: .loading, route: .loopback) == .loadInFlight)
+        #expect(action(route: .software) == .nextBuffer)
+        #expect(action(on: false, route: .software) == .nextBuffer)
+        #expect(action(route: .audio) == .nextBuffer)
+        #expect(action(route: .audio, avPlayerAudio: true) == .notEngineAudio)
+        #expect(action(route: .remoteBypass) == .notEngineAudio)
+        #expect(action(route: .none) == .notEngineAudio)
+    }
+
+    @Test("the re-anchor latch owes another pass for a settings change only while the stage is on")
+    func latchCountsSettings() {
+        func owes(delay: (Double, Double) = (0.1, 0.1), on: (Bool, Bool) = (true, true),
+                  generation: (UInt64, UInt64) = (3, 3)) -> Bool {
+            AetherEngine.audioReanchorOwesAnotherPass(deliveredDelay: delay.0, delay: delay.1,
+                                                      deliveredProcessing: on.0, processing: on.1,
+                                                      deliveredStageGeneration: generation.0,
+                                                      stageGeneration: generation.1)
+        }
+        #expect(owes() == false)
+        #expect(owes(generation: (3, 4)))
+        #expect(owes(on: (false, false), generation: (3, 4)) == false)
+        #expect(owes(on: (true, false)))
+        #expect(owes(delay: (0.1, 0.2)))
+    }
+
+    @Test("a load whose cut started before a change re-cuts once it settles")
+    func missedByLoadRule() {
+        #expect(AetherEngine.audioStageMissedByLoad(routedOn: false, nowOn: true, routedGeneration: 1, nowGeneration: 1))
+        #expect(AetherEngine.audioStageMissedByLoad(routedOn: true, nowOn: false, routedGeneration: 1, nowGeneration: 1))
+        #expect(AetherEngine.audioStageMissedByLoad(routedOn: true, nowOn: true, routedGeneration: 1, nowGeneration: 2))
+        #expect(AetherEngine.audioStageMissedByLoad(routedOn: false, nowOn: false, routedGeneration: 1, nowGeneration: 2) == false)
+        #expect(AetherEngine.audioStageMissedByLoad(routedOn: true, nowOn: true, routedGeneration: 2, nowGeneration: 2) == false)
+    }
+
+    @MainActor
+    @Test("on a loopback session a settings change re-cuts; during a load it waits for the settle, then re-cuts once")
+    func engineRecutsForSettings() throws {
+        let previousFactory = AudioSampleProcessingRegistry.factory
+        AudioSampleProcessingRegistry.factory = { nil }
+        defer { AudioSampleProcessingRegistry.factory = previousFactory }
+
+        let engine = try AetherEngine()
+        var options = LoadOptions()
+        options.audioSampleProcessing = true
+        engine.setLoadedOptionsForTesting(options)
+        var recuts: [String] = []
+        engine.audioStageRecutForTesting = { recuts.append($0) }
+
+        engine.videoRoute = .loopback
+        engine.state = .playing
+        let generation = engine.audioSampleProcessingParameterGeneration
+        #expect(engine.audioSampleProcessingParametersDidChange() == .recut)
+        #expect(recuts == ["settings"])
+        #expect(engine.audioSampleProcessingParameterGeneration == generation + 1)
+
+        // A load in flight: the change is counted, not cut; the settle compares and re-cuts once.
+        let session = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/r2596-r2.mkv"), dvModeAvailable: false)
+        session.audioSampleProcessing = true
+        engine.nativeVideoSession = session
+        engine.state = .loading
+        engine.audioSampleProcessingGenerationAtSessionStart = engine.audioSampleProcessingParameterGeneration
+        #expect(engine.audioSampleProcessingParametersDidChange() == .loadInFlight)
+        #expect(recuts.count == 1)
+        engine.state = .playing
+        #expect(recuts == ["settings", "missed by the load"])
+
+        // A settle with nothing missed cuts nothing.
+        engine.state = .loading
+        engine.audioSampleProcessingGenerationAtSessionStart = engine.audioSampleProcessingParameterGeneration
+        engine.state = .paused
+        #expect(recuts.count == 2)
+        engine.nativeVideoSession = nil
     }
 }

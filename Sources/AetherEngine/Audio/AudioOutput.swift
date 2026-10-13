@@ -228,9 +228,17 @@ final class AudioOutput: @unchecked Sendable {
     /// synchronizer clock, i.e. against the source axis too). Only the renderer sees the shift.
     @discardableResult
     func enqueue(sampleBuffer: CMSampleBuffer, ifEpoch epoch: UInt64? = nil) -> Bool {
+        // GiVo R2596-r2: a format change prepares the stage BEFORE the lock. `prepare` allocates and the host's
+        // stage logs from it, and neither belongs inside the section `flush` and the clock calls wait on. A
+        // buffer an earlier flush already retired prepares nothing (a flush racing this check costs at most a
+        // prepare for a format that is about to arrive anyway).
+        let prepareLine = processor.flatMap { stage in
+            epochIsCurrent(epoch) ? prepareProcessorIfNeeded(sampleBuffer, with: stage) : nil
+        }
         lock.lock()
         if let epoch, epoch != _epoch {
             lock.unlock()
+            if let prepareLine { EngineLog.emit(prepareLine, category: .swPlayback) }   // GiVo R2596-r2
             return false
         }
         // GiVo R2596: before `retimed`, whose copy shares these samples, and inside the lock so a flush
@@ -254,6 +262,7 @@ final class AudioOutput: @unchecked Sendable {
         afterRendererEnqueueForTesting?()
         #endif
         lock.unlock()
+        if let prepareLine { EngineLog.emit(prepareLine, category: .swPlayback) }   // GiVo R2596-r2
         if let processorLine { EngineLog.emit(processorLine, category: .swPlayback) }
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
 
@@ -285,20 +294,59 @@ final class AudioOutput: @unchecked Sendable {
     private var _loggedRendererError = false
     #endif
 
+    /// GiVo R2596-r2: the format half of the stage, run by `enqueue` BEFORE it takes `lock` (M4): a buffer whose
+    /// (rate, channels) differ from what the stage was last prepared for prepares it here, on the feed thread. The
+    /// format record itself is read and written under `lock`; `prepare` runs outside it. A concurrent enqueue that
+    /// slips between the record and the prepare runs one buffer against the previous format, which the stage
+    /// checks against the buffer list before it touches a sample. Returns the line to log, if any.
+    private func prepareProcessorIfNeeded(_ sampleBuffer: CMSampleBuffer, with processor: AudioSampleProcessing) -> String? {
+        guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              Self.stageTakes(asbd) else { return nil }   // processInPlace reports the skip
+        let current = ProcessorFormat(sampleRate: asbd.mSampleRate, channels: asbd.mChannelsPerFrame, isInterleaved: true)
+        lock.lock()
+        let previous = processorFormat
+        if current != previous { processorFormat = current }
+        lock.unlock()
+        guard current != previous else { return nil }
+        let layoutTag = CMAudioFormatDescriptionGetChannelLayout(format, sizeOut: nil)?.pointee.mChannelLayoutTag ?? 0
+        processor.prepare(sampleRate: current.sampleRate,
+                          channelCount: Int(current.channels),
+                          isInterleaved: current.isInterleaved,
+                          layoutTag: layoutTag)
+        return "[AudioOutput] sample processor "
+            + (previous == nil ? "attached" : "re-prepared")
+            + " — \(Int(current.sampleRate)) Hz, \(current.channels) ch (R2596)"
+    }
+
+    /// GiVo R2596-r2: whether a buffer stamped `epoch` would still be accepted right now.
+    private func epochIsCurrent(_ epoch: UInt64?) -> Bool {
+        guard let epoch else { return true }
+        lock.lock()
+        defer { lock.unlock() }
+        return epoch == _epoch
+    }
+
+    /// GiVo R2596-r2: what the stage takes on this route: interleaved Float32 linear PCM.
+    private static func stageTakes(_ asbd: AudioStreamBasicDescription) -> Bool {
+        asbd.mFormatID == kAudioFormatLinearPCM
+            && asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+            && asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+            && asbd.mBitsPerChannel == 32
+            && asbd.mChannelsPerFrame > 0
+    }
+
     /// GiVo R2596: run the host's stage over the buffer's own bytes. Caller holds `lock`. The decoder
     /// allocated those bytes for this buffer alone, so writing them in place touches nothing else the
     /// engine holds, apart from the #95 audio tap, which is fed this same buffer after the accept and so
-    /// carries the processed audio. `prepare` runs here, on the feed thread, never on the render thread.
-    /// The steady state allocates nothing: the buffer list lives on the stack and a line is built only
-    /// when there is one to log. Returns that line for the caller to emit once the lock is released.
+    /// carries the processed audio. The stage was prepared for this format by `prepareProcessorIfNeeded`,
+    /// outside the lock (GiVo R2596-r2). The steady state allocates nothing: the buffer list lives on the
+    /// stack and a line is built only when there is one to log. Returns that line for the caller to emit
+    /// once the lock is released.
     private func processInPlace(_ sampleBuffer: CMSampleBuffer, with processor: AudioSampleProcessing) -> String? {
         guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
-              asbd.mFormatID == kAudioFormatLinearPCM,
-              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
-              asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0,
-              asbd.mBitsPerChannel == 32,
-              asbd.mChannelsPerFrame > 0 else {
+              Self.stageTakes(asbd) else {
             return processorSkipLine("not interleaved Float32 PCM")
         }
         let frames = CMSampleBufferGetNumSamples(sampleBuffer)
@@ -319,28 +367,15 @@ final class AudioOutput: @unchecked Sendable {
             return processorSkipLine("block buffer shorter than \(frames) frames x \(asbd.mChannelsPerFrame) ch")
         }
 
-        var line: String?
-        let current = ProcessorFormat(sampleRate: asbd.mSampleRate, channels: asbd.mChannelsPerFrame, isInterleaved: true)
-        if current != processorFormat {
-            let layoutTag = CMAudioFormatDescriptionGetChannelLayout(format, sizeOut: nil)?.pointee.mChannelLayoutTag ?? 0
-            processor.prepare(sampleRate: current.sampleRate,
-                              channelCount: Int(current.channels),
-                              isInterleaved: current.isInterleaved,
-                              layoutTag: layoutTag)
-            line = "[AudioOutput] sample processor "
-                + (processorFormat == nil ? "attached" : "re-prepared")
-                + " — \(Int(current.sampleRate)) Hz, \(current.channels) ch (R2596)"
-            processorFormat = current
-        }
         var bufferList = AudioBufferList(
             mNumberBuffers: 1,
-            mBuffers: AudioBuffer(mNumberChannels: current.channels,
+            mBuffers: AudioBuffer(mNumberChannels: asbd.mChannelsPerFrame,
                                   mDataByteSize: UInt32(byteCount),
                                   mData: UnsafeMutableRawPointer(data)))
         withUnsafeMutablePointer(to: &bufferList) {
             processor.process(UnsafeMutableAudioBufferListPointer($0), frameCount: frames)
         }
-        return line
+        return nil
     }
 
     /// One line per output: a buffer the stage cannot take is delivered unprocessed, never dropped.
@@ -404,9 +439,12 @@ final class AudioOutput: @unchecked Sendable {
     /// Flush the audio renderer (call on seek).
     func flush() {
         lock.lock()
-        defer { lock.unlock() }
         _epoch &+= 1
         renderer.flush()
+        lock.unlock()
+        // GiVo R2596-r2: the stage drops what it holds of the flushed audio too. Outside `lock`: it takes the
+        // stage's own lock, which a concurrent `process` (inside `enqueue`'s locked section) may hold.
+        processor?.reset()
     }
 
     func stop() {

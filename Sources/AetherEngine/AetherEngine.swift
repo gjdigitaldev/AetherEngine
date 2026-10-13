@@ -62,6 +62,7 @@ public final class AetherEngine: ObservableObject {
             recomputePlaybackPhase()
             resolveLoadingStashedSeek(from: oldValue)
             settleOwedBackgroundAction()
+            deliverAudioStageMissedByLoad(leaving: oldValue)   // GiVo R2596-r2
             if let logTag { EngineLog.emit("[AetherEngine:\(logTag)] state=\(state)", category: .engine) }
         }
     }
@@ -2404,9 +2405,24 @@ public final class AetherEngine: ObservableObject {
     /// original audio. Outlives the session's own rebuilds, which is what stops a second attempt; a host load
     /// clears it. See `dropAudioSampleProcessingForSession`.
     var audioSampleProcessingDroppedForSession = false
+
+    /// GiVo R2596-r2: bumped by every change of the stage's own settings (`audioSampleProcessingParametersDidChange`)
+    /// that a cut segment carries, so the re-anchor latch and a settling load can tell the cut is stale.
+    var audioSampleProcessingParameterGeneration: UInt64 = 0
+    /// GiVo R2596-r2: the generation the current native session was created with (its cut starts from it).
+    var audioSampleProcessingGenerationAtSessionStart: UInt64 = 0
+
+    /// GiVo R2596-r2: a bridge the audio stage forced failed on this title and the engine rebuilt the session on the
+    /// original audio (`rebuildRefused` false), or could not rebuild it and the session plays on without that audio
+    /// (`rebuildRefused` true). Called once per drop, on the main actor, after the rebuild's outcome is known; not
+    /// called when a host load superseded the rebuild (that load is another title). A host shows the viewer why its
+    /// audio setting does nothing here; `audioSampleProcessingUnavailableForSession` reads the same latch.
+    public var onAudioSampleProcessingDropped: ((_ reason: String, _ rebuildRefused: Bool) -> Void)?
     #if DEBUG
     /// Test-only: replaces the takeover rebuild the drop starts, and receives the option change it applies.
     var audioSampleProcessingDropRebuildForTesting: ((@escaping @Sendable (inout LoadOptions) -> Void) -> Void)?
+    /// Test-only (GiVo R2596-r2): replaces the loopback re-cut a stage change starts, and receives its reason.
+    var audioStageRecutForTesting: ((String) -> Void)?
     #endif
 
     /// AE#464 round 2: the fourth narrow write, and the one that makes a session-preserving reload

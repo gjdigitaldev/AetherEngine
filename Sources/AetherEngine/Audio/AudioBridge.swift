@@ -344,7 +344,17 @@ final class AudioBridge: @unchecked Sendable {
         // probe -> garbled audio. The full path is correct; the only genuine failures are XLL frames that
         // residual-code channels without a usable core ("Residual encoded channels are present without core",
         // EINVAL -22), which feed() skips per-packet instead of failing the whole feed (#64).
-        let openRet = avcodec_open2(dec, srcCodec, nil)
+        // GiVo R2596-g — Dolby dialnorm. With the host's audio stage OFF an (E-)AC-3 track is stream-copied and
+        // the playing device's Dolby decoder applies the track's dialnorm (typically −4 … −7 dB). FFmpeg's decoder
+        // applies none by default (`target_level` 0), so the bridged path came out that much HOTTER than the
+        // untouched one and the host's Reduce Loud Sounds read as "louder with it on". `target_level=-31` makes
+        // the decoder normalise dialogue to the −31 dBFS reference exactly as a Dolby decoder does; the
+        // re-encoded E-AC-3 below is stamped dialnorm −31 so a downstream Dolby decoder adds nothing on top.
+        let normalisesDialnorm = srcCodecID == AV_CODEC_ID_AC3 || srcCodecID == AV_CODEC_ID_EAC3   // GiVo R2596-g
+        var decOpts: OpaquePointer? = nil   // GiVo R2596-g
+        if normalisesDialnorm { av_dict_set(&decOpts, "target_level", "-31", 0) }   // GiVo R2596-g
+        let openRet = avcodec_open2(dec, srcCodec, &decOpts)   // GiVo R2596-g
+        av_dict_free(&decOpts)   // GiVo R2596-g
         guard openRet >= 0 else {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
@@ -435,7 +445,8 @@ final class AudioBridge: @unchecked Sendable {
             + " "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
-            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
+            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))"
+            + (normalisesDialnorm ? " dialnorm normalised to -31 (R2596-g)" : ""),   // GiVo R2596-g
             category: .session
         )
 
@@ -453,7 +464,10 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.encoderOpenFailed(code: layoutCopyRet)
         }
-        let encOpenRet = avcodec_open2(enc, encCodec, nil)
+        var encOpts: OpaquePointer? = nil   // GiVo R2596-g
+        Self.setDialnormReference(&encOpts, encoder: encoderCodecID)   // GiVo R2596-g
+        let encOpenRet = avcodec_open2(enc, encCodec, &encOpts)   // GiVo R2596-g
+        av_dict_free(&encOpts)   // GiVo R2596-g
         guard encOpenRet >= 0 else {
             cleanup()
             throw AudioBridgeError.encoderOpenFailed(code: encOpenRet)
@@ -840,7 +854,11 @@ final class AudioBridge: @unchecked Sendable {
         enc.pointee.bit_rate = oldEnc.pointee.bit_rate
         enc.pointee.time_base = oldEnc.pointee.time_base
         let layoutRet = av_channel_layout_copy(&enc.pointee.ch_layout, &oldEnc.pointee.ch_layout)
-        guard layoutRet >= 0, avcodec_open2(enc, encCodec, nil) >= 0 else {
+        var encOpts: OpaquePointer? = nil   // GiVo R2596-g
+        Self.setDialnormReference(&encOpts, encoder: encoderCodecID)   // GiVo R2596-g
+        let reopenRet: Int32 = layoutRet >= 0 ? avcodec_open2(enc, encCodec, &encOpts) : layoutRet   // GiVo R2596-g
+        av_dict_free(&encOpts)   // GiVo R2596-g
+        guard reopenRet >= 0 else {   // GiVo R2596-g
             var tmp: UnsafeMutablePointer<AVCodecContext>? = enc
             avcodec_free_context(&tmp)
             EngineLog.emit(
@@ -860,6 +878,15 @@ final class AudioBridge: @unchecked Sendable {
             category: .session
         )
     }
+
+    /// GiVo R2596-g — the E-AC-3 we write carries the −31 dBFS dialnorm reference, matching the `target_level`
+    /// normalisation applied at decode: a Dolby decoder downstream then attenuates by 0 dB, so the bridged
+    /// path lands at the same level as the stream-copied one. FFmpeg's default is already −31; it is set
+    /// explicitly so a future encoder default cannot reopen the level gap.
+    private static func setDialnormReference(_ opts: inout OpaquePointer?, encoder: AVCodecID) {   // GiVo R2596-g
+        guard encoder == AV_CODEC_ID_EAC3 || encoder == AV_CODEC_ID_AC3 else { return }   // GiVo R2596-g
+        av_dict_set(&opts, "dialnorm", "-31", 0)   // GiVo R2596-g
+    }   // GiVo R2596-g
 
     private func cleanup() {
         if decoderCtx != nil {

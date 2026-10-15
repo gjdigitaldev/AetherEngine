@@ -352,8 +352,18 @@ final class AudioBridge: @unchecked Sendable {
         // re-encoded E-AC-3 below is stamped dialnorm −31 so a downstream Dolby decoder adds nothing on top.
         let normalisesDialnorm = srcCodecID == AV_CODEC_ID_AC3 || srcCodecID == AV_CODEC_ID_EAC3   // GiVo R2596-g
         var decOpts: OpaquePointer? = nil   // GiVo R2596-g
-        if normalisesDialnorm { av_dict_set(&decOpts, "target_level", "-31", 0) }   // GiVo R2596-g
+        if normalisesDialnorm {   // GiVo R2596-g
+            av_dict_set(&decOpts, "target_level", "-31", 0)   // GiVo R2596-g
+            // GiVo R2596-g2 — no decoder-side DRC on the bridged path. FFmpeg's default (`drc_scale` 1) applies the
+            // track's dynrng words in full, cuts AND boosts; the stream-copied path leaves that to the device's
+            // Dolby decoder, whose mode we cannot see. A boost on this path would lift quiet passages above the
+            // untouched path — the host's Reduce Loud Sounds promises never to be louder than Off — so the bridge
+            // hands the host the raw dynamics plus the dialnorm normalisation only; the host's own stage does the rest.
+            av_dict_set(&decOpts, "drc_scale", "0", 0)   // GiVo R2596-g2
+        }   // GiVo R2596-g
         let openRet = avcodec_open2(dec, srcCodec, &decOpts)   // GiVo R2596-g
+        // A key the decoder did not consume stays in the dictionary; the init line below says what was applied.
+        let dialnormApplied = normalisesDialnorm && av_dict_count(decOpts) == 0   // GiVo R2596-g2
         av_dict_free(&decOpts)   // GiVo R2596-g
         guard openRet >= 0 else {
             cleanup()
@@ -446,7 +456,8 @@ final class AudioBridge: @unchecked Sendable {
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))"
-            + (normalisesDialnorm ? " dialnorm normalised to -31 (R2596-g)" : ""),   // GiVo R2596-g
+            + (dialnormApplied ? " dialnorm normalised to -31, decoder DRC off (R2596-g)"   // GiVo R2596-g2
+               : (normalisesDialnorm ? " dialnorm options NOT consumed by this decoder (R2596-g2)" : "")),   // GiVo R2596-g2
             category: .session
         )
 
